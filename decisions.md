@@ -50,13 +50,33 @@ for both losses. This is acknowledged in paper §6.1.
 - `A*(x) = E_{y ~ p*(·|x)}[|y − H*(x)|]`  (mean absolute deviation around the median)
 - `E*(x) = E_θ[|h(x, θ) − H*(x)|]`  (per-θ-median deviation from H*)
 - Per-θ Bayes predictor: `h(x, θ) = median(p(·|x, θ))`
-- **`T* = A* + E*` is NOT exact under L1.** There is a covariance-style
-  cross-term. Methodological choice: report `A*` and `E*` separately
-  without claiming additivity (option (a)). Option (b) — the
-  Bregman-style construction in Hofman et al. 2024 / Gruber & Buettner
-  2023 with explicit cross-term — is deferred unless reviewers push
-  back. The implementation must NOT silently sum `A* + E*` under
-  absolute loss.
+
+### Identity vs. empirical-estimator additivity
+
+Under both squared and absolute loss, the paper's identity
+`T* = A* + E*` holds by definition (Definition 1).
+
+What is loss-specific is the EMPIRICAL ESTIMATION of `A*` and `E*`
+from finite-sample method outputs:
+
+- For squared loss, the empirical estimators `A_hat` (mean of
+  per-sample variances) and `E_hat` (variance of per-sample means)
+  satisfy a closed-form identity with the marginal mixture
+  variance via the law of total variance. This provides a clean
+  correctness check for the implementation.
+
+- For absolute loss, the empirical estimators `A_hat` (mean of
+  per-sample MADs around per-sample medians) and `E_hat`
+  (cross-sample dispersion of per-sample medians) do NOT enjoy a
+  corresponding law-of-total-deviation. Their sum does not equal
+  the marginal mixture MAD. This is a property of the L1 loss,
+  not a violation of the paper's framework.
+
+We report `A_hat` and `E_hat` under both losses as the
+loss-specific empirical analogues of `A*` and `E*`. The
+interpretation under squared loss has the additional comfort of
+bias-variance exactness; under absolute loss it does not. We
+acknowledge this in the paper's §6.1 limitations paragraph.
 
 ## p*(y | x) construction
 
