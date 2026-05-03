@@ -1,0 +1,43 @@
+# CIFAR-10H smoke config for ensemble end-to-end verification.
+#
+# Purpose: verify the ensemble pipeline runs end-to-end on real
+# CIFAR-10H data without any pathological output. NOT for paper
+# results; for that see cifar10h.yaml (production) or
+# cifar10h_calibration.yaml (calibration baseline).
+#
+# Differences from cifar10h_calibration.yaml: epochs reduced from 30
+# to 1 so that a 5-member ensemble fits in ~5 minutes on a single
+# RTX 3060 Laptop. All other knobs identical.
+
+name: cifar10h
+loader:
+  module: probly.datasets.torch
+  class: CIFAR10H
+loader_kwargs:
+  root: data/cifar10h
+  download: false
+supported_losses: [cross_entropy, zero_one]
+extraction_mode: full_network
+classifier:
+  architecture: probly_benchmark.resnet.ResNet18
+  pretrained_classifier_path: null
+  num_classes: 10
+training:
+  optimizer: sgd
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 5.0e-4
+  nesterov: false
+  batch_size: 128
+  epochs: 1
+  schedule: cosine
+  augmentation:
+    random_crop: {size: 32, padding: 4}
+    horizontal_flip: true
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std:  [0.2023, 0.1994, 0.2010]
+metadata:
+  num_classes: 10
+  num_test_samples: 10000
+  notes: "Smoke fixture: 1 epoch x 5 ensemble members for end-to-end pipeline verification."
