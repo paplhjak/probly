@@ -1,0 +1,28 @@
+# APPA-REAL dataset config.
+#
+# Apparent-age dataset (Agustsson et al. 2017) with per-rater integer
+# votes treated as p*(y|x) over the integer-age support. Per
+# decisions.md "APPA-REAL deployment losses", we report BOTH squared
+# and absolute error as primary results; AuReC and the Pareto-gap
+# consume scalar (A_hat, E_hat) per loss without knowing which loss
+# produced them.
+#
+# The default support is the per-split union of observed integer ages.
+# For the paper's main results we override age_support at runtime with
+#   support = AppaReal.compute_global_support(root)
+# so that A* / E* oracle computations are comparable across splits.
+
+name: appa_real
+loader:
+  module: probly.datasets.appa_real
+  class: AppaReal
+loader_kwargs:
+  root: data/appa_real
+  split: test
+  # age_support is filled at runtime by:
+  #   support = AppaReal.compute_global_support(root)
+  # See decisions.md "APPA-REAL deployment losses" for why the global
+  # support is used for the paper's main results.
+supported_losses: [squared, absolute]
+metadata:
+  notes: "Apparent age, integer-vote histogram over age_support."

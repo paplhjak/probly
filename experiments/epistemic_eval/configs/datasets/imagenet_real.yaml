@@ -1,0 +1,21 @@
+# ImageNet-ReaL dataset config.
+#
+# ImageNet validation set with the ReaL relabeling from Beyer et al.
+# 2020. Empty-label images are dropped per decisions.md "p*(y | x)
+# construction" via ImageNetReaLDropEmpty (see
+# experiments/epistemic_eval/scripts/imagenet_real_adapter.py).
+#
+# Run check_imagenet_real_buckets.py once on the actual real.json to
+# refresh experiments/epistemic_eval/imagenet_real_buckets.md and
+# verify the dropped-fraction is small.
+
+name: imagenet_real
+loader:
+  module: experiments.epistemic_eval.scripts.imagenet_real_adapter
+  class: ImageNetReaLDropEmpty
+loader_kwargs:
+  root: data/imagenet
+supported_losses: [cross_entropy, zero_one]
+metadata:
+  num_classes: 1000
+  notes: "ImageNet val with ReaL relabeling. Empty-label images dropped per decisions.md."

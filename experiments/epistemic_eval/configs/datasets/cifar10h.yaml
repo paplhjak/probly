@@ -1,0 +1,23 @@
+# CIFAR-10H dataset config.
+#
+# CIFAR-10 test split (10k images) with the human soft labels from
+# Peterson et al. 2019 (cifar-10h-master/data/cifar10h-counts.npy).
+# Used as a first-order classification dataset; supported losses are
+# cross-entropy and zero-one (the latter via the same per-class
+# probability vector).
+#
+# See decisions.md "Deployment loss" and "p*(y | x) construction" for
+# the contract this config plays into.
+
+name: cifar10h
+loader:
+  module: probly.datasets.torch
+  class: CIFAR10H
+loader_kwargs:
+  root: data/cifar10h
+  download: false
+supported_losses: [cross_entropy, zero_one]
+metadata:
+  num_classes: 10
+  num_test_samples: 10000
+  notes: "CIFAR-10 test split with human soft labels from cifar-10h-master/data/cifar10h-counts.npy."
