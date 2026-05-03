@@ -1,0 +1,12 @@
+# MC-Dropout method config.
+#
+# Wired to experiments.epistemic_eval.methods.mc_dropout via
+# `method_module`. Adding a new method = a new config file with a
+# new method_module string; no changes to the orchestrator or the
+# fit/extract scripts.
+
+name: mc_dropout
+method_module: experiments.epistemic_eval.methods.mc_dropout
+n_samples: 20
+classifier_dropout_p: 0.1
+head_dropout_p: 0.1

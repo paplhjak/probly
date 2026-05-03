@@ -1,0 +1,16 @@
+# Deep Ensembles method config.
+#
+# Wired to experiments.epistemic_eval.methods.ensemble via
+# `method_module`. Adding a new method = a new config file with a
+# new method_module string; no changes to the orchestrator or the
+# fit/extract scripts.
+#
+# `seed_strategy: derived` means per-member seeds are derived from
+# the run's root seed via experiments.epistemic_eval.methods._base.derive_member_seed.
+
+name: ensemble
+method_module: experiments.epistemic_eval.methods.ensemble
+n_members: 5
+seed_strategy: derived
+head_dropout_p: 0.1
+classifier_dropout_p: 0.0

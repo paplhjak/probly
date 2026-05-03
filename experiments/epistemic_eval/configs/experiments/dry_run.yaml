@@ -1,0 +1,19 @@
+# Dry-run experiment grid for the orchestrator.
+#
+# Used by experiments/epistemic_eval/scripts/run_grid.py with
+# --dry-run. Composes a tiny CIFAR-10H grid that exercises both
+# methods on a single seed; per-method overrides shrink epochs and
+# n_samples / n_members so the smoke run stays fast.
+
+methods: [mc_dropout, ensemble]
+datasets: [cifar10h]
+seeds: [0]
+overrides:
+  cifar10h:
+    training:
+      epochs: 2
+      batch_size: 32
+  mc_dropout:
+    n_samples: 4
+  ensemble:
+    n_members: 3

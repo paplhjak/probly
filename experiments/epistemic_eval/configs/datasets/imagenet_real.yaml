@@ -16,6 +16,17 @@ loader:
 loader_kwargs:
   root: data/imagenet
 supported_losses: [cross_entropy, zero_one]
+extraction_mode: full_network
+classifier:
+  architecture: torchvision.models.resnet50
+  pretrained_classifier_path: data/imagenet/resnet50_seed0.pth   # null = error per decisions.md "ImageNet-ReaL training data"
+  num_classes: 1000
+ensemble_classifier_paths:           # list of N paths for ensemble members; required for ensemble runs
+  - data/imagenet/resnet50_seed0.pth
+  - data/imagenet/resnet50_seed1.pth
+  - data/imagenet/resnet50_seed2.pth
+  - data/imagenet/resnet50_seed3.pth
+  - data/imagenet/resnet50_seed4.pth
 metadata:
   num_classes: 1000
   notes: "ImageNet val with ReaL relabeling. Empty-label images dropped per decisions.md."
