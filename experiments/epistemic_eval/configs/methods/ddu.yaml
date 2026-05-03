@@ -13,7 +13,8 @@ output_schema: ddu_probs_density
 
 # Training hyperparameters (Phase A: classifier training under
 # spectral-norm-bounded hidden Linear/Conv2d layers).
-epochs: 30
+# ``epochs: 200`` matches basecls and ensemble production recipe.
+epochs: 200
 lr: 1.0e-3
 weight_decay: 5.0e-4
 

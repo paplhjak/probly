@@ -11,10 +11,9 @@ method_module: experiments.epistemic_eval.methods.evidential_classification
 # field to dispatch to the right per-schema decomposition function.
 output_schema: evidential_alpha
 
-# Training hyperparameters. ``epochs`` matches the calibration recipe
-# (``cifar10h_calibration.yaml``); production runs override via
-# the dataset config or experiment config.
-epochs: 30
+# Training hyperparameters. ``epochs: 200`` matches basecls and
+# ensemble production recipe.
+epochs: 200
 lr: 1.0e-3
 weight_decay: 5.0e-4
 
