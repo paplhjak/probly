@@ -121,10 +121,14 @@ learned model. (This is the whole point of "first-order datasets".)
   - The Dropout layer participates in MC-Dropout at inference.
   - For ensemble members, dropout is disabled at inference (standard
     practice).
-  - For LLLA, the Laplace approximation covers the second `Linear`
-    layer's weights; dropout is disabled.
   - For evidential, the second `Linear` is replaced by the evidential
     head (Softplus + 1).
+  - For DDU, the head Linear is preserved as `classification_head`
+    (probly's `ddu(...)` swaps the head with `nn.Identity()` and
+    keeps the head separately so the encoder is a pure feature
+    extractor); spectral norm is applied to all hidden Linear and
+    Conv2d layers, and the post-hoc GMM density is fit on the
+    encoder's output features.
 - **Adaptation on APPA-REAL train:** linear-probe / shallow-head
   training. Backbone features extracted once and cached; UQ training
   iterates over cached features, not raw images.
@@ -157,25 +161,58 @@ learned model. (This is the whole point of "first-order datasets".)
 
 ## Methods to evaluate
 
-The paper lists "MC-Dropout, Deep Ensembles, Last-Layer Laplace,
-Evidential Networks". The pipeline is method-agnostic so any probly
-method can be plugged in.
+The paper compares four UQ methods spanning the major UQ families:
+variational sampling, multi-model uncertainty, single-pass
+Dirichlet, and post-hoc density-based. Last-Layer Laplace
+Approximation (LLLA) was considered and dropped — see "LLLA
+dropped" subsection below.
 
-**Frozen list for the paper's main results table:** `mcd`, `ensemble`,
-`llla`, `evidential`. Each gets a config in
+**Frozen list for the paper's main results table:** `mcd`,
+`ensemble`, `evidential`, `ddu`. Each gets a config in
 `experiments/epistemic_eval/configs/methods/`.
 
-- `mcd` → probly's `dropout` (`probly.method.dropout`).
-- `ensemble` → probly's `ensemble` (`probly.method.ensemble`).
-- `llla` → external `laplace-torch` (Daxberger et al.), pinned in
-  `pyproject.toml` to `>=0.2.2,<0.3`. probly does not ship a Laplace
-  approximation per `probly_audit.md` §1; the `bayesian` method is
-  variational mean-field (Blundell), not Laplace. The adapter wraps
-  `laplace.Laplace(...)` over the head only. Whether to lift the
-  wrapper into a probly library module at `src/probly/method/laplace/`
-  is a design decision deferred to Task 5.
-- `evidential` → probly's `evidential_classification`; for APPA-REAL
-  regression-style decompositions, `evidential_regression`.
+- `mcd` → probly's `dropout` (`probly.method.dropout`). MC-Dropout
+  (Gal & Ghahramani 2016) — variational sampling via Bernoulli
+  dropout at inference.
+- `ensemble` → probly's `ensemble` (`probly.method.ensemble`). Deep
+  Ensembles (Lakshminarayanan et al. 2017) — multi-model uncertainty
+  via independently-trained members.
+- `evidential` → probly's `evidential_classification`
+  (`probly.method.evidential.classification`). Evidential Deep
+  Learning (Sensoy et al. 2018) — Dirichlet-output approach
+  producing concentration parameters directly from a single forward
+  pass. For APPA-REAL regression, `evidential_regression` (Amini
+  et al. 2020) is the analog.
+- `ddu` → probly's `ddu` (`probly.method.ddu`). Deep Deterministic
+  Uncertainty (Mukhoti et al. 2023) — deterministic single-forward-pass
+  UQ via post-hoc Gaussian Mixture Model density estimation in the
+  spectrally-normalised feature space. Two-phase pipeline: train a
+  classifier with spectral-norm-bounded hidden layers, then fit a
+  class-conditional GMM on penultimate features.
+
+### Why DDU specifically
+
+DDU is included to test the paper's central empirical claim: good
+OOD-detection performance does not imply good regret-ranking in the
+first-order setting. We expect DDU to underperform the
+sampling-based methods on AuReC despite being competitive on
+traditional OOD-detection benchmarks. Either outcome is informative
+for the paper.
+
+### LLLA dropped
+
+Last-Layer Laplace Approximation (LLLA) was considered and dropped:
+
+1. probly's `epistemic-eval` branch does not contain a Laplace
+   approximation module. An implementation exists on `main` but the
+   paper-stage decision is not to merge `main` into `epistemic-eval`.
+2. Adding LLLA via the external `laplace-torch` library was
+   considered but rejected: LLLA, MC-Dropout, and mean-field BNN
+   all live in the same "Gaussian posterior over weights" UQ
+   family. Adding LLLA over the existing MC-Dropout would add an
+   instance, not a family. The paper compares four UQ
+   *families*; spending one slot on a second member of the
+   variational-sampling family would not broaden the comparison.
 
 **ImageNet-ReaL ensemble construction.** Deep Ensembles on ImageNet-ReaL
 uses N independently pretrained classifiers (Lakshminarayanan et al.
@@ -195,8 +232,8 @@ The pipeline accepts any probly method via config; this list is the
   - APPA-REAL linear-probe runs are cheap; 5 seeds essentially free.
   - CIFAR-10H and ImageNet-ReaL reuse probly checkpoints where
     possible; seeds in those cells correspond to UQ-side randomness
-    (ensemble member init, dropout RNG, LLLA sampling), not to full
-    backbone retraining.
+    (ensemble member init, dropout RNG, evidential weight init,
+    DDU GMM-fit perturbations), not to full backbone retraining.
 - Seeds fixed and committed in the experiment configs.
 - Deep Ensembles: ensemble size N is itself a hyperparameter; default
   N=5. The "seed" of an ensemble run is the seed of the seed-generator
