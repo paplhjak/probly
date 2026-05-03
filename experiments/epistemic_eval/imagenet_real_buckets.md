@@ -1,21 +1,13 @@
 # ImageNet-ReaL bucket fractions
 
-**STATUS: PLACEHOLDER.** Run
-
-    python experiments/epistemic_eval/scripts/check_imagenet_real_buckets.py \
-        --real-json <path-to-reassessed-imagenet-master>/real.json \
-        --output experiments/epistemic_eval/imagenet_real_buckets.md
-
-to overwrite this file with the real numbers, then commit.
-
 | Bucket           |  Count  | Fraction |
 |------------------|--------:|---------:|
-| empty            |       ? |        ? |
-| single-label     |       ? |        ? |
-| multi-label (2)  |       ? |        ? |
-| multi-label (3)  |       ? |        ? |
-| multi-label (4+) |       ? |        ? |
-| **total**        |       ? |   100.00% |
+| empty            |    3163 |    6.33% |
+| single-label     |   39394 |   78.79% |
+| multi-label (2)  |    5408 |   10.82% |
+| multi-label (3)  |    1319 |    2.64% |
+| multi-label (4+) |     716 |    1.43% |
+| **total**        |   50000 | 100.00% |
 
 ## Notes
 
