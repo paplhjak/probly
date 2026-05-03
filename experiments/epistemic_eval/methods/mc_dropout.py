@@ -277,6 +277,14 @@ def extract(
     model.load_state_dict(handle.state_dict)
     _set_dropout_train_mode(model)
 
+    # Run inference on GPU when one is available; falls back to CPU
+    # otherwise. The MC-Dropout forward-pass loop is the dominant
+    # cost on CIFAR-10 / ImageNet test sets, and CPU is ~50x slower
+    # than a consumer GPU for ResNet-18-class models.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    _set_dropout_train_mode(model)  # to(device) re-runs train(False), so re-enable dropout
+
     n = data_provider.n_samples
     k = data_provider.n_classes
     logits_out = np.zeros((n, k, n_samples), dtype=np.float32)
@@ -292,6 +300,7 @@ def extract(
         for s in range(n_samples):
             offset = 0
             for x, _ in data_provider:
+                x = x.to(device, non_blocking=True)
                 out = model(x).detach().cpu().to(torch.float32).numpy()
                 bsz = out.shape[0]
                 logits_out[offset : offset + bsz, :, s] = out

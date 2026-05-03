@@ -261,15 +261,22 @@ def extract(
     # (Task 6.5) can produce a (N, K, S) tensor that downstream
     # code is free to interpret. We therefore run forward passes
     # manually instead of using Sampler.predict().
+    # Run inference on GPU when one is available; falls back to CPU
+    # otherwise. Each ensemble member's forward pass is independent,
+    # so we move the per-member model to GPU once and stream batches
+    # to it.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with torch.no_grad():
         for member_idx, sd in enumerate(handle.state_dicts):
             model = model_factory()
             model.load_state_dict(sd)
+            model = model.to(device)
             # Per decisions.md "APPA-REAL backbone strategy": dropout
             # is disabled at inference for ensemble members.
             model.eval()
             offset = 0
             for x, _ in data_provider:
+                x = x.to(device, non_blocking=True)
                 out = model(x).detach().cpu().to(torch.float32).numpy()
                 bsz = out.shape[0]
                 logits_out[offset : offset + bsz, :, member_idx] = out

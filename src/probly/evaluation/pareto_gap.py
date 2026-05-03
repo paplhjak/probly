@@ -119,12 +119,25 @@ def igd_plus(reference_set: Any, achievable_set: Any) -> float:
     ref = _check_2d_finite_real_three_columns(reference_set, name="reference_set")
     ach = _check_2d_finite_real_three_columns(achievable_set, name="achievable_set")
 
-    # Broadcast difference of shape (M, K, 3) and clip negatives so
-    # that achievable points dominating the reference contribute zero.
-    diff = ach[np.newaxis, :, :] - ref[:, np.newaxis, :]
-    np.maximum(diff, 0.0, out=diff)
-    sq = np.sum(diff * diff, axis=2)
-    d_plus = np.sqrt(np.min(sq, axis=1))
+    # Chunked computation: for each chunk of ``ref`` points, compute
+    # the broadcast distance against the entire ``ach`` set, take the
+    # min along the achievable axis, and accumulate. The vectorised
+    # form ``diff = ach[None, :, :] - ref[:, None, :]`` allocates an
+    # ``(M, K, 3)`` array which can exceed memory for the ``N=10000``
+    # surfaces produced on real datasets (10001 operating points per
+    # angle/lambda direction; 51 * 10001 vs 91 * 10001 -> ~10 TiB
+    # cross product). Cap the per-chunk allocation at ~256 MiB by
+    # picking a chunk size whose product with ``len(ach)`` fits.
+    chunk_bytes_target = 256 * 1024 * 1024  # 256 MiB
+    bytes_per_pair = 3 * np.dtype(np.float64).itemsize
+    chunk_size = max(1, chunk_bytes_target // (max(len(ach), 1) * bytes_per_pair))
+    d_plus = np.empty(len(ref), dtype=np.float64)
+    for start in range(0, len(ref), chunk_size):
+        stop = min(start + chunk_size, len(ref))
+        diff = ach[np.newaxis, :, :] - ref[start:stop, np.newaxis, :]
+        np.maximum(diff, 0.0, out=diff)
+        sq = np.sum(diff * diff, axis=2)
+        d_plus[start:stop] = np.sqrt(np.min(sq, axis=1))
     return float(np.mean(d_plus))
 
 
@@ -156,6 +169,8 @@ def pareto_gap(
     *,
     n_lambda: int = 51,
     n_directions: int = 91,
+    max_surface_points: int = 20_000,
+    subsample_seed: int = 0,
 ) -> float:
     """Compute the Pareto-gap between oracle and method achievable surfaces.
 
@@ -196,6 +211,21 @@ def pareto_gap(
         n_directions: Number of angles on the empirical
             ``theta``-grid in ``[0, 2 pi)``; defaults to ``91``. Must
             be ``>= 2``.
+        max_surface_points: Cap on the per-surface point count fed
+            into :func:`igd_plus`. The sweep helpers emit
+            ``n_lambda * (N + 1)`` and ``n_directions * (N + 1)``
+            operating points respectively; for real datasets
+            (``N >= 10000``) this exceeds memory and wall-time budgets
+            for the dense ``M x K`` cross-product in :func:`igd_plus`.
+            When either surface is larger than ``max_surface_points``
+            we uniformly subsample down to that size; the IGD+
+            estimate is unbiased and converges as
+            ``max_surface_points`` grows. Defaults to ``20000``,
+            which keeps the cross-product under ~10 GiB for typical
+            grid sizes. Set to ``0`` or a negative value to disable
+            subsampling.
+        subsample_seed: Seed for the subsampling RNG; defaults to
+            ``0`` for deterministic results across runs.
 
     Returns:
         The Pareto-gap as a Python ``float``.
@@ -222,4 +252,12 @@ def pareto_gap(
     )
     s_star_flipped = _flip_coverage(s_star)
     s_flipped = _flip_coverage(s)
+    if max_surface_points and max_surface_points > 0:
+        rng = np.random.default_rng(subsample_seed)
+        if len(s_star_flipped) > max_surface_points:
+            idx = rng.choice(len(s_star_flipped), size=max_surface_points, replace=False)
+            s_star_flipped = s_star_flipped[np.sort(idx)]
+        if len(s_flipped) > max_surface_points:
+            idx = rng.choice(len(s_flipped), size=max_surface_points, replace=False)
+            s_flipped = s_flipped[np.sort(idx)]
     return igd_plus(s_star_flipped, s_flipped)
