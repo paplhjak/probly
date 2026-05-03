@@ -34,6 +34,17 @@ if str(_REPO_ROOT) not in sys.path:
 
 from experiments.epistemic_eval.methods._base import FeatureProvider  # noqa: E402
 from probly.method.head import MlpHead  # noqa: E402
+from probly.quantification.decomposition import OutputSchema  # noqa: E402
+
+#: Per-schema set of cache keys that ``predictions.npz`` must contain
+#: for the dispatch chain in ``compute_decomposition.py`` to succeed.
+#: Every method's ``extract()`` is contractually required to return a
+#: dict with these keys + ``"indices"``. Mismatch is a wrapper bug.
+_REQUIRED_KEYS_BY_SCHEMA: dict[str, frozenset[str]] = {
+    "logits_nks": frozenset({"logits"}),
+    "evidential_alpha": frozenset({"alpha", "evidence"}),
+    "ddu_probs_density": frozenset({"probs", "density"}),
+}
 
 
 def _resolve_callable(dotted: str) -> Any:  # noqa: ANN401
@@ -219,14 +230,61 @@ def main(argv: list[str] | None = None) -> int:
     out = method_module.extract(
         handle, provider, n_samples=n_samples, model_factory=factory
     )
-    np.savez_compressed(
-        run_dir / "predictions.npz",
-        logits=out["logits"],
-        indices=out["indices"],
+
+    # Schema-aware cache write. Each method's ``extract()`` returns a
+    # dict whose keys depend on ``output_schema``: sampling-based
+    # methods write ``logits`` of shape ``(N, K, S)``; evidential
+    # writes ``alpha`` + ``evidence``; DDU writes ``probs`` + ``density``.
+    # ``indices`` is required for every schema. Pre-schema runs
+    # (no ``output_schema`` field) default to ``"logits_nks"`` for
+    # backwards compatibility with mc_dropout / ensemble caches built
+    # before Task 5b.
+    output_schema_raw = method_config.get("output_schema", "logits_nks")
+    if not isinstance(output_schema_raw, str):
+        msg = (
+            f"method config 'output_schema' must be a string, got "
+            f"{type(output_schema_raw).__name__}: {output_schema_raw!r}."
+        )
+        raise TypeError(msg)
+    valid_schemas = OutputSchema.__args__  # type: ignore[attr-defined]
+    if output_schema_raw not in valid_schemas:
+        msg = (
+            f"unknown output_schema {output_schema_raw!r} in method config; "
+            f"expected one of {valid_schemas!r}."
+        )
+        raise ValueError(msg)
+    output_schema: str = output_schema_raw
+
+    required = _REQUIRED_KEYS_BY_SCHEMA[output_schema]
+    missing = required - set(out)
+    if missing:
+        msg = (
+            f"method module {method_config['method_module']!r} returned "
+            f"keys {sorted(out)}, missing required {sorted(missing)} for "
+            f"schema {output_schema!r}."
+        )
+        raise ValueError(msg)
+    if "indices" not in out:
+        msg = (
+            f"method module {method_config['method_module']!r} returned "
+            f"no 'indices' key in extract(); 'indices' is required for "
+            f"every schema."
+        )
+        raise ValueError(msg)
+
+    # Save only the schema-required keys + indices, deterministic
+    # alphabetical order for readability of resulting predictions.npz.
+    payload = {key: out[key] for key in sorted(required)}
+    payload["indices"] = out["indices"]
+    np.savez_compressed(run_dir / "predictions.npz", **payload)
+
+    shape_summary = ", ".join(
+        f"{k}={tuple(payload[k].shape)}"
+        for k in sorted(required)
     )
     print(
         f"wrote {run_dir / 'predictions.npz'} "
-        f"(logits shape={out['logits'].shape})"
+        f"(schema={output_schema}, {shape_summary})"
     )
     return 0
 
