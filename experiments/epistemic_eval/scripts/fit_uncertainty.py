@@ -43,6 +43,33 @@ from experiments.epistemic_eval.methods._base import (  # noqa: E402
 )
 from probly.method.head import MlpHead  # noqa: E402
 
+#: UQ methods that train (or otherwise iterate the training set) at
+#: ``fit`` time when run on a from-scratch full-network dataset (no
+#: ``ensemble_classifier_paths`` set in the dataset config). These
+#: methods need a real CIFAR-10 train provider, not the metadata-only
+#: stub that the load-pretrained branch uses.
+#:
+#: Membership rationale (one entry per method that needs it):
+#:   * ``ensemble``: trains N independent members from scratch with
+#:     derived seeds (Lakshminarayanan et al. 2017).
+#:   * ``evidential``: trains a base classifier with the soft-label
+#:     evidential cross-entropy (Sensoy et al. 2018).
+#:   * ``ddu``: Phase A trains the spectral-norm-restricted
+#:     classifier; Phase B walks the train set to fit the GMM
+#:     density head (Mukhoti et al. 2023).
+#:
+#: Mc_dropout is intentionally absent: in full-network mode it loads
+#: a pretrained classifier and only applies probly's dropout
+#: transformation, with ``epochs = 0`` short-circuiting any
+#: training-loop iteration. New methods that need real train data at
+#: fit time must be added here AND wired through their respective
+#: wrapper.
+_FROM_SCRATCH_FULL_NETWORK_METHODS: frozenset[str] = frozenset({
+    "ensemble",
+    "evidential",
+    "ddu",
+})
+
 
 def _resolve_callable(dotted: str) -> Any:  # noqa: ANN401
     """Resolve a dotted path like ``a.b:c`` or ``a.b.c`` to a callable."""
@@ -349,23 +376,25 @@ def main(argv: list[str] | None = None) -> int:
         if head_factory_args is not None:
             method_config_with_args["head_factory_args"] = head_factory_args
     else:
-        # Full-network: three sub-paths, dispatched on the (method,
-        # ensemble_classifier_paths) pair.
+        # Full-network: three sub-paths, dispatched on whether the
+        # method trains from scratch and whether per-member
+        # checkpoints are pre-supplied.
         #
         # 1. ``ensemble`` + ``ensemble_classifier_paths`` set
         #    (ImageNet-ReaL): :func:`ensemble.fit` loads the N
         #    pretrained checkpoints itself; we hand it a stub
         #    provider and a base factory, no training happens here.
-        # 2. ``ensemble`` without ``ensemble_classifier_paths``
-        #    (CIFAR-10H from-scratch ensembles): each member needs
-        #    independent training with a derived seed, so we build a
-        #    real CIFAR-10H training provider and pass an unwrapped
-        #    base factory (so each ``model_factory()`` call yields a
-        #    freshly initialised model that diverges per
-        #    ``setup_determinism(member_seed)``).
-        # 3. ``mc_dropout`` (and any other "wrap a pretrained classifier"
-        #    method): load stage-1's classifier, wrap the factory with
-        #    its state_dict, and short-circuit training via
+        # 2. Method ∈ ``_FROM_SCRATCH_FULL_NETWORK_METHODS`` AND no
+        #    ``ensemble_classifier_paths`` (CIFAR-10H from-scratch
+        #    training): build a real CIFAR-10H training provider so
+        #    the wrapper's fit() can iterate real data. Pass an
+        #    unwrapped base factory (each ``model_factory()`` call
+        #    yields a freshly initialised model). Currently only
+        #    CIFAR-10H is wired; other datasets raise loudly.
+        # 3. ``mc_dropout`` (and any other "wrap a pretrained
+        #    classifier" method not in the from-scratch set): load
+        #    stage-1's classifier, wrap the factory with its
+        #    state_dict, and short-circuit training via
         #    ``epochs = 0``.
         method_name = method_config.get("name")
         base_factory, _ = _build_full_network_factory(dataset_config)
@@ -374,18 +403,22 @@ def main(argv: list[str] | None = None) -> int:
             # Path 1.
             provider = _make_full_network_stub_provider(dataset_config)
             factory = base_factory
-        elif method_name == "ensemble":
-            # Path 2: from-scratch ensemble training. Currently only
-            # CIFAR-10H is wired through; ImageNet-ReaL is expected to
-            # use the ensemble_classifier_paths path. Fail loudly if
-            # we land here on any other dataset to keep the contract
-            # explicit.
+        elif method_name in _FROM_SCRATCH_FULL_NETWORK_METHODS:
+            # Path 2: from-scratch full-network training (currently
+            # ensemble / evidential / ddu). All three iterate the
+            # train provider in their fit() (ensemble: per-member
+            # training; evidential: classifier training under the
+            # evidential CE loss; ddu: Phase A classifier training
+            # + Phase B GMM density-head fit on encoder features).
+            # Only CIFAR-10H is wired; ImageNet-ReaL is expected to
+            # use the ensemble_classifier_paths path with one of the
+            # frozen ensemble checkpoint sets.
             if dataset_config.get("name") != "cifar10h":
                 msg = (
-                    f"from-scratch full-network ensemble training is "
-                    f"only wired for CIFAR-10H; got dataset "
-                    f"{dataset_config.get('name')!r}. Either provide "
-                    f"`ensemble_classifier_paths` in the dataset "
+                    f"from-scratch full-network training for method "
+                    f"{method_name!r} is only wired for CIFAR-10H; got "
+                    f"dataset {dataset_config.get('name')!r}. Either "
+                    f"provide `ensemble_classifier_paths` in the dataset "
                     f"config or extend fit_uncertainty.py with a "
                     f"per-dataset training provider."
                 )
