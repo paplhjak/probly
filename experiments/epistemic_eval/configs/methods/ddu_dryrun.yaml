@@ -1,0 +1,21 @@
+# Dry-run override of `ddu.yaml`.
+#
+# Single-epoch variant for end-to-end pipeline verification on the
+# cluster (fit -> extract -> decompose -> metrics). NOT for the
+# paper-grid run; production grids use `ddu.yaml`. See
+# `experiments/epistemic_eval/cluster/README.md` -> "Dry runs".
+#
+# All other knobs identical to `ddu.yaml` so any pipeline regression
+# here surfaces in the production config too.
+
+name: ddu
+method_module: experiments.epistemic_eval.methods.ddu
+
+output_schema: ddu_probs_density
+
+# Differs from ddu.yaml only here: 30 -> 1.
+epochs: 1
+lr: 1.0e-3
+weight_decay: 5.0e-4
+
+sn_coeff: 3.0

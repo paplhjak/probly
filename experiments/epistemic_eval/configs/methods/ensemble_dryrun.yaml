@@ -1,0 +1,28 @@
+# Dry-run override of `ensemble.yaml`.
+#
+# Two-member, single-epoch variant for end-to-end pipeline
+# verification on the cluster (fit -> extract -> decompose ->
+# metrics). NOT for the paper-grid run; production grids use
+# `ensemble.yaml` (n_members: 5). See
+# `experiments/epistemic_eval/cluster/README.md` -> "Dry runs".
+#
+# n_members is set to 2 (the smallest value that still exercises
+# the multi-member dispatch in extract / compute_decomposition);
+# any ensemble-specific bug appears at n_members >= 2.
+
+name: ensemble
+method_module: experiments.epistemic_eval.methods.ensemble
+
+output_schema: logits_nks
+
+# Differs from ensemble.yaml: n_members 5 -> 2 and adds epochs/lr.
+n_members: 2
+seed_strategy: derived
+head_dropout_p: 0.1
+classifier_dropout_p: 0.0
+
+# AdamW hyperparameters consumed by ensemble._train_member; matches
+# the smoke-config recipe in `cifar10h_ensemble_smoke.yaml`.
+epochs: 1
+lr: 1.0e-3
+weight_decay: 0.0
