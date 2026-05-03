@@ -10,6 +10,12 @@
 
 name: ensemble
 method_module: experiments.epistemic_eval.methods.ensemble
+
+# Cache schema declaration. compute_decomposition.py reads this
+# field to dispatch to the right per-schema decomposition function.
+# Pre-schema runs default to "logits_nks" for backwards compatibility.
+output_schema: logits_nks
+
 n_members: 5
 seed_strategy: derived
 head_dropout_p: 0.1

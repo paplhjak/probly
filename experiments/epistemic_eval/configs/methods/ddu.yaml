@@ -1,0 +1,22 @@
+# DDU (Deep Deterministic Uncertainty) method config.
+#
+# Wraps probly's `ddu` (single-pass classifier + post-hoc Gaussian
+# Mixture density head) via experiments.epistemic_eval.methods.ddu.
+# See decisions.md "Methods to evaluate" for the rationale.
+
+name: ddu
+method_module: experiments.epistemic_eval.methods.ddu
+
+# Cache schema declaration. compute_decomposition.py reads this
+# field to dispatch to the right per-schema decomposition function.
+output_schema: ddu_probs_density
+
+# Training hyperparameters (Phase A: classifier training under
+# spectral-norm-bounded hidden Linear/Conv2d layers).
+epochs: 30
+lr: 1.0e-3
+weight_decay: 5.0e-4
+
+# Mukhoti 2023 spectral-norm Lipschitz coefficient. probly's default
+# is 3.0; the original paper uses 3.0 for ResNet18 on CIFAR.
+sn_coeff: 3.0

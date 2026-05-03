@@ -48,7 +48,8 @@ from experiments.epistemic_eval.methods._base import hash_config  # noqa: E402
 from probly.quantification.decomposition import (  # noqa: E402
     _DECOMPOSITION_VERSION,
     LossName,
-    decompose,
+    OutputSchema,
+    decompose_from_schema,
 )
 
 
@@ -87,12 +88,24 @@ def _support_fingerprint(support: np.ndarray) -> str:
     return hashlib.blake2b(arr.tobytes() + str(arr.dtype).encode(), digest_size=8).hexdigest()
 
 
-def _per_loss_hash(dataset_name: str, loss: str, support: np.ndarray) -> str:
-    """Stable hash of (dataset, loss, support, decomposition version)."""
+def _per_loss_hash(
+    dataset_name: str,
+    loss: str,
+    support: np.ndarray,
+    output_schema: str,
+) -> str:
+    """Stable hash of (dataset, loss, support, schema, version).
+
+    The ``output_schema`` is included so a schema change (e.g. switching a
+    method from sampling-based to evidential) invalidates the cache. Without
+    it, a re-run with a different schema could silently leave a stale
+    ``decomposition_<loss>.npz`` in place.
+    """
     payload = {
         "dataset": dataset_name,
         "loss": loss,
         "support_fingerprint": _support_fingerprint(support),
+        "output_schema": output_schema,
         "decomposition_version": int(_DECOMPOSITION_VERSION),
     }
     return hash_config(payload)
@@ -117,6 +130,83 @@ def _load_dataset_config(
         msg = f"resolved config at {resolved} has no 'dataset' section."
         raise KeyError(msg)
     return merged["dataset"]
+
+
+def _load_method_config(run_dir: Path) -> dict[str, Any]:
+    """Read the method config block from the run's resolved config.yaml.
+
+    Returns an empty dict if the file or section is missing -- callers
+    that need the schema field will fall back to the ``"logits_nks"``
+    default for backwards compatibility with pre-schema runs.
+    """
+    resolved = run_dir / "config.yaml"
+    if not resolved.exists():
+        return {}
+    merged = yaml.safe_load(resolved.read_text())
+    method = merged.get("method")
+    return method if isinstance(method, dict) else {}
+
+
+def _output_schema_from_method_config(method_config: dict[str, Any]) -> str:
+    """Read ``output_schema`` from the method config with a logits-NKS default.
+
+    Pre-schema (Task-5b) runs have no ``output_schema`` field; treat
+    them as ``"logits_nks"`` to preserve backwards compatibility with
+    previously-cached mc_dropout / ensemble runs.
+    """
+    schema = method_config.get("output_schema")
+    if schema is None:
+        return "logits_nks"
+    if not isinstance(schema, str):
+        msg = (
+            f"method config 'output_schema' must be a string, got "
+            f"{type(schema).__name__}: {schema!r}."
+        )
+        raise TypeError(msg)
+    valid = OutputSchema.__args__  # type: ignore[attr-defined]
+    if schema not in valid:
+        msg = (
+            f"unknown output_schema {schema!r} in method config; expected "
+            f"one of {valid!r}."
+        )
+        raise ValueError(msg)
+    return schema
+
+
+def _k_from_predictions(predictions: dict[str, np.ndarray], schema: str) -> int:
+    """Return the K (number of classes) implied by the cached arrays."""
+    if schema == "logits_nks":
+        logits = predictions["logits"]
+        if logits.ndim != 3:
+            msg = f"predictions['logits'] must be 3-D, got shape={logits.shape}."
+            raise ValueError(msg)
+        return int(logits.shape[1])
+    if schema == "evidential_alpha":
+        alpha = predictions["alpha"]
+        if alpha.ndim != 2:
+            msg = f"predictions['alpha'] must be 2-D, got shape={alpha.shape}."
+            raise ValueError(msg)
+        return int(alpha.shape[1])
+    if schema == "ddu_probs_density":
+        probs = predictions["probs"]
+        if probs.ndim != 2:
+            msg = f"predictions['probs'] must be 2-D, got shape={probs.shape}."
+            raise ValueError(msg)
+        return int(probs.shape[1])
+    msg = f"unknown output_schema: {schema!r}."
+    raise ValueError(msg)
+
+
+def _n_from_predictions(predictions: dict[str, np.ndarray], schema: str) -> int:
+    """Return the N (number of test points) implied by the cached arrays."""
+    if schema == "logits_nks":
+        return int(predictions["logits"].shape[0])
+    if schema == "evidential_alpha":
+        return int(predictions["alpha"].shape[0])
+    if schema == "ddu_probs_density":
+        return int(predictions["probs"].shape[0])
+    msg = f"unknown output_schema: {schema!r}."
+    raise ValueError(msg)
 
 
 def _resolve_support(dataset_config: dict[str, Any], k: int) -> np.ndarray:
@@ -176,18 +266,21 @@ def main(argv: list[str] | None = None) -> int:
         raise KeyError(msg)
     supported_losses = list(supported_losses_raw)
 
+    method_config = _load_method_config(run_dir)
+    output_schema = _output_schema_from_method_config(method_config)
+
     blob = np.load(predictions_path, allow_pickle=False)
-    logits = np.asarray(blob["logits"])
     indices = np.asarray(blob["indices"])
-    if logits.ndim != 3:
-        msg = f"predictions.npz['logits'] must be 3-D, got shape={logits.shape}."
-        raise ValueError(msg)
-    k = int(logits.shape[1])
+    predictions: dict[str, np.ndarray] = {
+        key: np.asarray(blob[key]) for key in blob.files if key != "indices"
+    }
+    k = _k_from_predictions(predictions, output_schema)
+    n = _n_from_predictions(predictions, output_schema)
     support = _resolve_support(dataset_config, k)
 
     per_loss_hashes: dict[str, str] = {}
     for loss in supported_losses:
-        loss_hash = _per_loss_hash(dataset_name, str(loss), support)
+        loss_hash = _per_loss_hash(dataset_name, str(loss), support, output_schema)
         per_loss_hashes[loss] = loss_hash
         cache_file = run_dir / f"decomposition_{loss}.npz"
         sidecar = run_dir / f"decomposition_{loss}.config_hash"
@@ -195,7 +288,12 @@ def main(argv: list[str] | None = None) -> int:
             if sidecar.read_text().strip() == loss_hash:
                 print(f"cache hit for loss={loss}; skipping (sidecar matches).")
                 continue
-        out = decompose(logits, cast("LossName", str(loss)), support)
+        out = decompose_from_schema(
+            predictions,
+            cast("LossName", str(loss)),
+            support,
+            schema=cast("OutputSchema", output_schema),
+        )
         np.savez_compressed(
             cache_file,
             A_hat=out["A_hat"],
@@ -204,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
             indices=indices.astype(np.int64, copy=False),
         )
         sidecar.write_text(loss_hash)
-        print(f"wrote {cache_file} (n={logits.shape[0]}, k={k}).")
+        print(f"wrote {cache_file} (n={n}, k={k}, schema={output_schema}).")
 
     _write_meta(run_dir, per_loss_hashes)
     return 0

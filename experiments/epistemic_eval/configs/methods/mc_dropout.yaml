@@ -7,6 +7,12 @@
 
 name: mc_dropout
 method_module: experiments.epistemic_eval.methods.mc_dropout
+
+# Cache schema declaration. compute_decomposition.py reads this
+# field to dispatch to the right per-schema decomposition function.
+# Pre-schema runs default to "logits_nks" for backwards compatibility.
+output_schema: logits_nks
+
 n_samples: 20
 classifier_dropout_p: 0.1
 head_dropout_p: 0.1
