@@ -9,6 +9,13 @@ from :mod:`probly.quantification.oracle` for every loss declared in
 ``experiments/epistemic_eval/runs/<oracle_run_id>/``, where
 ``oracle_run_id = make_run_id("oracle", dataset_name, seed=0)``.
 
+Stage-2 also emits ``p_star.npz`` (a loss-independent sidecar) so
+downstream metric computation in ``compute_metrics.py`` doesn't need
+to re-derive ``p*`` from dataset configs. The sidecar holds keys
+``p_star`` (``float32 (N, K)``), ``support`` (``int64 (K,)``), and
+``indices`` (``int64 (N,)``), and is hashed loss-independently
+(dataset + support fingerprint + ``_ORACLE_VERSION``).
+
 Loading ``p*``:
 
 * The default path is to read ``--p-star-path`` (a ``.npz`` file
@@ -105,6 +112,24 @@ def _per_loss_hash(
     payload = {
         "dataset": dataset_name,
         "loss": loss,
+        "support_fingerprint": _support_fingerprint(support),
+        "oracle_version": int(_ORACLE_VERSION),
+    }
+    return hash_config(payload)
+
+
+def _p_star_sidecar_hash(
+    dataset_name: str,
+    support: np.ndarray | None,
+) -> str:
+    """Loss-independent hash for the ``p_star.npz`` sidecar.
+
+    The sidecar is shared across all losses (it carries only ``p*``,
+    the support, and the row indices), so its hash covers only the
+    dataset, the support fingerprint, and the oracle version.
+    """
+    payload = {
+        "dataset": dataset_name,
         "support_fingerprint": _support_fingerprint(support),
         "oracle_version": int(_ORACLE_VERSION),
     }
@@ -213,6 +238,47 @@ def main(argv: list[str] | None = None) -> int:
         )
         sidecar.write_text(loss_hash)
         print(f"wrote {cache_file} (n={n}, k={k}).")
+
+    # Write the loss-independent p_star sidecar (Task 7). Written once
+    # per dataset so downstream metric computation doesn't need to
+    # re-derive p* from dataset configs. The hash is loss-independent;
+    # it covers dataset_name, support fingerprint, and _ORACLE_VERSION.
+    sidecar_hash = _p_star_sidecar_hash(dataset_name, support)
+    sidecar_path = run_dir / "p_star.npz"
+    sidecar_hash_path = run_dir / "p_star.config_hash"
+    if (
+        not sidecar_path.exists()
+        or not sidecar_hash_path.exists()
+        or sidecar_hash_path.read_text().strip() != sidecar_hash
+        or args.force_recompute
+    ):
+        if support is None:
+            sidecar_support = np.arange(k, dtype=np.int64)
+        else:
+            support_arr = np.asarray(support)
+            if support_arr.dtype.kind in {"i", "u"}:
+                sidecar_support = support_arr.astype(np.int64, copy=False)
+            else:
+                # APPA-REAL ages may be stored as float64; cast only when
+                # the values are integral. A non-integral support would
+                # be a regression task we don't currently target.
+                if not np.all(np.equal(np.mod(support_arr, 1.0), 0.0)):
+                    msg = (
+                        f"support has non-integer values (dtype={support_arr.dtype}); "
+                        f"the p_star sidecar requires an integer support."
+                    )
+                    raise ValueError(msg)
+                sidecar_support = support_arr.astype(np.int64, copy=False)
+        np.savez_compressed(
+            sidecar_path,
+            p_star=p_star.astype(np.float32, copy=False),
+            support=sidecar_support,
+            indices=indices.astype(np.int64, copy=False),
+        )
+        sidecar_hash_path.write_text(sidecar_hash)
+        print(f"wrote {sidecar_path}.")
+    else:
+        print(f"cache hit for p_star sidecar; skipping (sidecar matches).")
 
     _write_meta(run_dir, per_loss_hashes)
     return 0

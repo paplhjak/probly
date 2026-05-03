@@ -308,3 +308,8 @@ experiments/epistemic_eval/assets/appa_real_backbone/*
 
 # Epistemic-eval — run outputs (cached predictions, oracle, metrics)
 experiments/epistemic_eval/runs/
+
+# Task 7 — aggregated metrics outputs (rebuilt per-run, not version-controlled)
+experiments/epistemic_eval/results/*.csv
+experiments/epistemic_eval/results/*.md
+!experiments/epistemic_eval/results/README.md
