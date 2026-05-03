@@ -19,10 +19,10 @@ from probly.evaluation.selectors import (
     sweep_oracle_surface,
 )
 
-
 # ---------------------------------------------------------------------------
 # IGD+ closed-form tests
 # ---------------------------------------------------------------------------
+
 
 def test_igd_plus_single_point_translation() -> None:
     # Test (i): one reference point, one achievable point shifted on
@@ -68,6 +68,7 @@ def test_igd_plus_uses_min_over_achievable_set() -> None:
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+
 
 def test_igd_plus_empty_reference_raises() -> None:
     with pytest.raises(ValueError, match="at least one row"):

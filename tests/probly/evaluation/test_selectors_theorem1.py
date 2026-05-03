@@ -19,7 +19,6 @@ from probly.evaluation.selectors import (
     threshold_selector,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixture
 # ---------------------------------------------------------------------------
@@ -35,6 +34,7 @@ E = [0.4, 0.1, 0.7, 0.2, 0.6]
 # ---------------------------------------------------------------------------
 # Endpoint identities
 # ---------------------------------------------------------------------------
+
 
 def test_convex_lambda_half_recovers_threshold_on_half_sum() -> None:
     # Sub-test (i): convex(lambda=0.5, tau=0.3) thresholds (A+E)/2
@@ -93,6 +93,7 @@ def test_lambda_half_and_lambda_one_disagree_on_unaligned_inputs() -> None:
 # Validation
 # ---------------------------------------------------------------------------
 
+
 def test_convex_lambda_below_zero_raises() -> None:
     with pytest.raises(ValueError, match=r"lambda_.*\[0, 1\]"):
         convex_selector(A, E, lambda_=-0.01, tau=0.5)
@@ -147,6 +148,7 @@ def test_linear_inf_weights_raise() -> None:
 # ---------------------------------------------------------------------------
 # Surface sweeps: shape contract + endpoints
 # ---------------------------------------------------------------------------
+
 
 def test_oracle_sweep_has_expected_shape() -> None:
     a_star = np.array([0.1, 0.2, 0.3, 0.4, 0.5])

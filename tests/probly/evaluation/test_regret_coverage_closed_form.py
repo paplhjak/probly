@@ -18,10 +18,10 @@ from probly.evaluation.regret_coverage import (
     risk_coverage_curve,
 )
 
-
 # ---------------------------------------------------------------------------
 # Closed-form value tests
 # ---------------------------------------------------------------------------
+
 
 def test_aurec_main_5_point_fixture() -> None:
     # Test A from the brief.
@@ -100,6 +100,7 @@ def test_risk_coverage_curve_matches_regret_coverage_curve_when_inputs_are_equal
 # Boundary properties
 # ---------------------------------------------------------------------------
 
+
 def test_curve_endpoints() -> None:
     rng = np.random.default_rng(0)
     n = 17
@@ -125,6 +126,7 @@ def test_aurec_accepts_numpy_arrays_and_python_lists_identically() -> None:
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
+
 
 def test_empty_score_raises() -> None:
     with pytest.raises(ValueError, match="non-empty"):
