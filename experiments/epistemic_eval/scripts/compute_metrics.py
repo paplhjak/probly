@@ -66,6 +66,7 @@ from probly.evaluation.regret_coverage import (  # noqa: E402
     aurec,
     aurc,
 )
+from probly.quantification.decomposition import OutputSchema  # noqa: E402
 from probly.quantification.realized_regret import (  # noqa: E402
     LossName,
     compute_realized_regret,
@@ -96,13 +97,22 @@ def _config_hash(
     dataset: str,
     loss: str,
     seed: int,
+    output_schema: str,
 ) -> str:
-    """Stable hash covering the fields that decide cache validity."""
+    """Stable hash covering the fields that decide cache validity.
+
+    Includes ``output_schema`` so a method that switches schemas
+    (e.g. evidential moving from ``evidential_alpha`` to a future
+    ``evidential_logits_alpha`` variant) invalidates the cached
+    metrics JSON instead of silently reusing stale values that were
+    computed against a different cache layout.
+    """
     payload = {
         "method": method,
         "dataset": dataset,
         "loss": loss,
         "seed": int(seed),
+        "output_schema": output_schema,
         "_metrics_version": int(_METRICS_VERSION),
         "_aurec_version": int(_AUREC_VERSION),
         "_pareto_gap_version": int(_PARETO_GAP_VERSION),
@@ -137,18 +147,125 @@ def _resolve_method_dataset_seed(run_dir: Path) -> tuple[str, str, int]:
     return method, dataset, int(seed_val)
 
 
-def _bma_from_logits(logits: np.ndarray) -> np.ndarray:
-    """Return ``softmax(logits, axis=1).mean(axis=2)``.
+def _resolve_output_schema(run_dir: Path) -> str:
+    """Read ``output_schema`` from the run's method config.
 
-    Uses the standard log-sum-exp trick for numerical stability.
+    Defaults to ``"logits_nks"`` when the field is absent so caches
+    written before Task 5b's schema-aware refactor (which had only
+    sampling-based methods) keep working.
+
+    Raises ``ValueError`` on any unknown schema string so a typo in
+    the config blows up at metric-computation time rather than after
+    a 12-hour SLURM job.
     """
-    if logits.ndim != 3:
-        msg = f"logits must be 3-D (N, K, S); got shape={logits.shape}."
+    cfg = _load_run_config(run_dir)
+    method_block = cfg.get("method") or {}
+    raw = method_block.get("output_schema")
+    if raw is None:
+        return "logits_nks"
+    if not isinstance(raw, str):
+        msg = (
+            f"method config 'output_schema' must be a string, got "
+            f"{type(raw).__name__}: {raw!r}."
+        )
+        raise TypeError(msg)
+    valid = OutputSchema.__args__  # type: ignore[attr-defined]
+    if raw not in valid:
+        msg = (
+            f"unknown output_schema {raw!r} in method config at "
+            f"{run_dir / 'config.yaml'}; expected one of {valid!r}."
+        )
         raise ValueError(msg)
-    shifted = logits - logits.max(axis=1, keepdims=True)
-    exp = np.exp(shifted)
-    softmax = exp / exp.sum(axis=1, keepdims=True)
-    return np.asarray(softmax.mean(axis=2), dtype=np.float64)
+    return raw
+
+
+def _bma_from_predictions(
+    predictions: dict[str, np.ndarray],
+    schema: str,
+) -> np.ndarray:
+    """Return the empirical Bayes (categorical) predictor from cached arrays.
+
+    Each schema implies its own way of collapsing the cache to an
+    ``(N, K)`` row-stochastic predictor, used downstream by
+    :func:`compute_realized_regret`:
+
+    * ``"logits_nks"``       -- ``softmax(logits, axis=1).mean(axis=2)``;
+                                 the per-sample softmax averaged over
+                                 the ``S``-axis (Bayesian model
+                                 average over posterior samples).
+                                 Numerically stable via log-sum-exp.
+    * ``"evidential_alpha"`` -- ``alpha / alpha.sum(axis=1, keepdims=True)``;
+                                 the Dirichlet posterior mean
+                                 (equivalent to the BMA over the
+                                 implied categorical posterior).
+                                 No S-axis: evidential is a single
+                                 forward pass that emits Dirichlet
+                                 concentration parameters directly.
+    * ``"ddu_probs_density"`` -- ``probs`` (already row-stochastic);
+                                 DDU caches its softmax classifier
+                                 head's output directly. The
+                                 GMM-density is an OOD signal, NOT
+                                 part of the categorical predictor.
+
+    Args:
+        predictions: Dict of cached arrays from ``predictions.npz``.
+            The required keys depend on ``schema``.
+        schema: One of the entries in
+            :data:`probly.quantification.decomposition.OutputSchema`.
+
+    Returns:
+        ``(N, K) float64`` row-stochastic categorical predictor.
+
+    Raises:
+        ValueError: If ``schema`` is unknown, the schema-required
+            keys are missing, or the cached arrays have the wrong
+            shape.
+    """
+    if schema == "logits_nks":
+        if "logits" not in predictions:
+            msg = (
+                f"schema={schema!r} requires `predictions['logits']`; "
+                f"got keys {sorted(predictions)}."
+            )
+            raise ValueError(msg)
+        logits = predictions["logits"]
+        if logits.ndim != 3:
+            msg = f"logits must be 3-D (N, K, S); got shape={logits.shape}."
+            raise ValueError(msg)
+        shifted = logits - logits.max(axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        softmax = exp / exp.sum(axis=1, keepdims=True)
+        return np.asarray(softmax.mean(axis=2), dtype=np.float64)
+    if schema == "evidential_alpha":
+        if "alpha" not in predictions:
+            msg = (
+                f"schema={schema!r} requires `predictions['alpha']`; "
+                f"got keys {sorted(predictions)}."
+            )
+            raise ValueError(msg)
+        alpha = np.asarray(predictions["alpha"], dtype=np.float64)
+        if alpha.ndim != 2:
+            msg = f"alpha must be 2-D (N, K); got shape={alpha.shape}."
+            raise ValueError(msg)
+        alpha0 = alpha.sum(axis=1, keepdims=True)
+        return alpha / alpha0
+    if schema == "ddu_probs_density":
+        if "probs" not in predictions:
+            msg = (
+                f"schema={schema!r} requires `predictions['probs']`; "
+                f"got keys {sorted(predictions)}."
+            )
+            raise ValueError(msg)
+        probs = np.asarray(predictions["probs"], dtype=np.float64)
+        if probs.ndim != 2:
+            msg = f"probs must be 2-D (N, K); got shape={probs.shape}."
+            raise ValueError(msg)
+        return probs
+    msg = (
+        f"unknown output_schema: {schema!r}; expected one of "
+        f"{OutputSchema.__args__!r}."  # type: ignore[attr-defined]
+    )
+    raise ValueError(msg)
 
 
 def _load_decomposition(run_dir: Path, loss: str) -> tuple[np.ndarray, np.ndarray]:
@@ -230,8 +347,9 @@ def main(argv: list[str] | None = None) -> int:
     p_star_path = args.p_star_path or (oracle_run / "p_star.npz")
 
     method, dataset, seed = _resolve_method_dataset_seed(run_dir)
+    output_schema = _resolve_output_schema(run_dir)
     loss_str = str(args.loss)
-    cfg_hash = _config_hash(method, dataset, loss_str, seed)
+    cfg_hash = _config_hash(method, dataset, loss_str, seed, output_schema)
     metrics_path = run_dir / f"metrics_{loss_str}.json"
     hash_path = run_dir / f"metrics_{loss_str}.config_hash"
 
@@ -255,17 +373,36 @@ def main(argv: list[str] | None = None) -> int:
         )
         raise FileNotFoundError(msg)
     pred_blob = np.load(predictions_path, allow_pickle=False)
-    logits = np.asarray(pred_blob["logits"])
+    # Dict-style load: each schema's per-method extract() writes its
+    # own keys (logits / alpha+evidence / probs+density). The "indices"
+    # key is universal and lives outside the schema dispatch.
+    if "indices" not in pred_blob.files:
+        msg = (
+            f"predictions.npz at {predictions_path} is missing the "
+            f"required 'indices' key; got {list(pred_blob.files)}."
+        )
+        raise KeyError(msg)
+    predictions: dict[str, np.ndarray] = {
+        key: np.asarray(pred_blob[key])
+        for key in pred_blob.files
+        if key != "indices"
+    }
     indices = np.asarray(pred_blob["indices"])
 
     a_hat, e_hat = _load_decomposition(run_dir, loss_str)
     a_star, e_star = _load_oracle(oracle_run, loss_str)
     p_star, support = _load_p_star(p_star_path)
 
-    # Sanity: the oracle, decomposition and p_star arrays must agree on N.
+    bma = _bma_from_predictions(predictions, output_schema)
+
+    # Sanity: the BMA, oracle, decomposition and p_star arrays must
+    # all agree on N. We use BMA (rather than any specific cached
+    # array) as the schema-agnostic source for the row count, since
+    # `_bma_from_predictions` already validates the schema-required
+    # array's shape contract.
     n = int(indices.shape[0])
     for arr_name, arr in [
-        ("logits", logits),
+        ("bma", bma),
         ("a_hat", a_hat),
         ("e_hat", e_hat),
         ("a_star", a_star),
@@ -279,7 +416,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             raise ValueError(msg)
 
-    bma = _bma_from_logits(logits)
     regret = compute_realized_regret(
         p_star,
         bma,
