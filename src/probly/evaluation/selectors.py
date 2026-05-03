@@ -330,7 +330,11 @@ def sweep_empirical_surface(
     n_dir_int = _check_int_at_least(n_directions, minimum=2, name="n_directions")
 
     thetas = np.linspace(
-        0.0, 2.0 * np.pi, n_dir_int, endpoint=False, dtype=np.float64,
+        0.0,
+        2.0 * np.pi,
+        n_dir_int,
+        endpoint=False,
+        dtype=np.float64,
     )
     blocks = []
     for theta in thetas:

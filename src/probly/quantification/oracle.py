@@ -59,7 +59,14 @@ from probly.quantification._validation import (
 )
 
 #: Bumped on math changes to invalidate caches.
-_ORACLE_VERSION = 1
+#:
+#: History:
+#:     v1 (Task 6): initial; per-loss ``oracle_<loss>.npz`` only.
+#:     v2 (Task 7): ``compute_oracle.py`` also emits a loss-independent
+#:         ``p_star.npz`` sidecar (``p_star``, ``support``, ``indices``);
+#:         v1 caches lack it and are invalidated by this version bump.
+# Bumped to 2 in Task 7: compute_oracle.py now emits p_star.npz sidecar; v1 caches lack it.
+_ORACLE_VERSION = 2
 
 LossName = Literal["cross_entropy", "zero_one", "squared", "absolute"]
 

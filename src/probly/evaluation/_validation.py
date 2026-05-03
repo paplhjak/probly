@@ -43,17 +43,11 @@ def _check_1d_finite_real(arr: Any, *, name: str) -> np.ndarray:
 
     # Reject complex / object / string dtypes outright.
     if coerced.dtype.kind not in {"b", "i", "u", "f"}:
-        msg = (
-            f"`{name}` must be a real numeric array, "
-            f"got dtype={coerced.dtype!r}."
-        )
+        msg = f"`{name}` must be a real numeric array, got dtype={coerced.dtype!r}."
         raise TypeError(msg)
 
     if coerced.ndim != 1:
-        msg = (
-            f"`{name}` must be 1-D, got ndim={coerced.ndim} "
-            f"with shape={coerced.shape}."
-        )
+        msg = f"`{name}` must be 1-D, got ndim={coerced.ndim} with shape={coerced.shape}."
         raise ValueError(msg)
 
     if coerced.size == 0:
@@ -101,10 +95,7 @@ def _check_finite_scalar(value: Any, *, name: str) -> float:
         raise ValueError(msg)
 
     if arr.dtype.kind not in {"b", "i", "u", "f"}:
-        msg = (
-            f"`{name}` must be a real numeric scalar, "
-            f"got dtype={arr.dtype!r}."
-        )
+        msg = f"`{name}` must be a real numeric scalar, got dtype={arr.dtype!r}."
         raise TypeError(msg)
 
     out = float(arr)

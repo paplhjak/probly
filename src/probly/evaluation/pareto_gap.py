@@ -27,6 +27,12 @@ from probly.evaluation.selectors import (
     sweep_oracle_surface,
 )
 
+_PARETO_GAP_VERSION: int = 1
+"""Module-level version of the Pareto-gap (IGD+) implementation.
+Bumped on math changes; read by ``compute_metrics.py`` and written
+into ``metrics_<loss>.json`` as ``_pareto_gap_version`` for cache
+invalidation."""
+
 
 def _check_2d_finite_real_three_columns(arr: Any, *, name: str) -> np.ndarray:
     """Coerce ``arr`` to a 2-D, finite, real-valued ``(M, 3)`` array.
@@ -49,22 +55,13 @@ def _check_2d_finite_real_three_columns(arr: Any, *, name: str) -> np.ndarray:
     """
     coerced = np.asarray(arr)
     if coerced.dtype.kind not in {"b", "i", "u", "f"}:
-        msg = (
-            f"`{name}` must be a real numeric array, "
-            f"got dtype={coerced.dtype!r}."
-        )
+        msg = f"`{name}` must be a real numeric array, got dtype={coerced.dtype!r}."
         raise TypeError(msg)
     if coerced.ndim != 2:
-        msg = (
-            f"`{name}` must be 2-D with shape (M, 3), got ndim="
-            f"{coerced.ndim} with shape={coerced.shape}."
-        )
+        msg = f"`{name}` must be 2-D with shape (M, 3), got ndim={coerced.ndim} with shape={coerced.shape}."
         raise ValueError(msg)
     if coerced.shape[1] != 3:
-        msg = (
-            f"`{name}` must have exactly 3 columns, "
-            f"got shape={coerced.shape}."
-        )
+        msg = f"`{name}` must have exactly 3 columns, got shape={coerced.shape}."
         raise ValueError(msg)
     if coerced.shape[0] == 0:
         msg = f"`{name}` must contain at least one row."

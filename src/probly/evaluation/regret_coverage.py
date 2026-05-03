@@ -29,6 +29,12 @@ from probly.evaluation._validation import (
     _check_matching_lengths,
 )
 
+_AUREC_VERSION: int = 1
+"""Module-level version of the AuReC implementation. Bumped on math
+changes; read by ``compute_metrics.py`` and written into
+``metrics_<loss>.json`` as ``_aurec_version`` for cache invalidation
+across formula updates."""
+
 
 def _coverage_curve(score: np.ndarray, value: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Build the rejection / coverage curve underlying both AuReC and AuRC.
