@@ -188,28 +188,224 @@ def _resolve_dataset_run_id(config: dict[str, Any], seed: int) -> str:
     return make_run_id(method="basecls", dataset=str(config["name"]), seed=seed)
 
 
+def _read_cifar10h_training_hparams(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract the training hyperparameters from a CIFAR-10H config.
+
+    Validates declared values against the small set of options the
+    training loop currently supports (SGD + cosine annealing). Raises
+    on unknown values rather than silently falling back -- per the
+    project convention every hyperparameter must come from config.
+    """
+    training = config["training"]
+    optimizer_name = str(training["optimizer"])
+    if optimizer_name != "sgd":
+        msg = f"unknown optimizer {optimizer_name!r}; only 'sgd' is supported."
+        raise ValueError(msg)
+    schedule = str(training["schedule"])
+    if schedule != "cosine":
+        msg = f"unknown schedule {schedule!r}; only 'cosine' is supported."
+        raise ValueError(msg)
+    aug = training["augmentation"]
+    norm = training["normalization"]
+    return {
+        "lr": float(training["lr"]),
+        "momentum": float(training["momentum"]),
+        "weight_decay": float(training["weight_decay"]),
+        "nesterov": bool(training["nesterov"]),
+        "batch_size": int(training["batch_size"]),
+        "epochs": int(training["epochs"]),
+        "crop_size": int(aug["random_crop"]["size"]),
+        "crop_padding": int(aug["random_crop"]["padding"]),
+        "horizontal_flip": bool(aug["horizontal_flip"]),
+        "mean": tuple(float(x) for x in norm["mean"]),
+        "std": tuple(float(x) for x in norm["std"]),
+    }
+
+
 def _train_cifar10h_run(
-    config: dict[str, Any],  # noqa: ARG001
-    run_dir: Path,  # noqa: ARG001
-    seed: int,  # noqa: ARG001
+    config: dict[str, Any],
+    run_dir: Path,
+    seed: int,
 ) -> None:
     """Train a ``ResNet18`` from scratch on CIFAR-10 train per the config.
 
-    Training requires the CIFAR-10 train data to be present at
-    ``loader_kwargs['root']``. Pulling and training the real model is
-    a multi-hour job on a single H200 GPU; the function exists so the
-    code path is in place for the cluster runs (Task 9). The smoke
-    test path uses ``--smoke-test-synthetic`` and never executes this
-    function.
+    Reads SGD/cosine/200-epoch hyperparameters from
+    ``config['training']``; uses
+    :class:`probly_benchmark.resnet.ResNet18` as the classifier.
+    Loads CIFAR-10 train via ``torchvision.datasets.CIFAR10`` with
+    ``download=True`` (cached at ``loader_kwargs['root']``); splits
+    50k train into a 45k train / 5k val partition deterministically by
+    ``seed``. Trains, prints epoch/loss/val-acc per epoch, and writes:
+
+    * ``classifier.pth`` -- the model state_dict (CPU tensors).
+    * ``training_log.csv`` -- ``epoch,train_loss,val_loss,train_acc,val_acc``.
+
+    Idempotent: if ``classifier.pth`` exists with a matching
+    ``classifier.config_hash`` sidecar, the function logs a "skipped"
+    message and returns without retraining.
+
+    Determinism follows the project convention: torch / numpy global
+    seeds + ``torch.use_deterministic_algorithms(True, warn_only=True)``
+    via :func:`_base.setup_determinism`.
+
+    Args:
+        config: Resolved CIFAR-10H dataset config (from YAML).
+        run_dir: Output directory; must already exist.
+        seed: Root seed for the run.
+
+    Raises:
+        ValueError: On unknown optimizer or schedule, or if the locked
+            ``num_classes`` does not match the ``ResNet18`` architecture
+            (which is hardcoded to 10).
     """
-    msg = (
-        "CIFAR-10H from-scratch training loop not yet implemented. "
-        "Hyperparameters are in configs/datasets/cifar10h.yaml under "
-        "'training:'. Implement in scripts/train_classifier.py before "
-        "Task 9. See decisions.md 'CIFAR-10H training data' for context. "
-        "For local smoke testing use --smoke-test-synthetic."
+    # Late imports: keep torchvision and the heavy ResNet18 module out
+    # of the import path of the synthetic-only smoke test.
+    import torchvision  # noqa: PLC0415
+    from torchvision import transforms as T  # noqa: PLC0415
+
+    from probly_benchmark.resnet import ResNet18  # noqa: PLC0415
+
+    classifier_path = run_dir / "classifier.pth"
+    hash_sidecar = run_dir / "classifier.config_hash"
+    config_hash = hash_config(config)
+    if (
+        classifier_path.exists()
+        and hash_sidecar.exists()
+        and hash_sidecar.read_text().strip() == config_hash
+    ):
+        print(f"skipped: classifier exists at {classifier_path}.")
+        return
+
+    setup_determinism(seed)
+
+    hp = _read_cifar10h_training_hparams(config)
+    num_classes = int(config["classifier"]["num_classes"])
+    if num_classes != 10:
+        msg = (
+            "probly_benchmark.resnet.ResNet18 is hardcoded to 10 classes; "
+            f"got num_classes={num_classes}. Use a different architecture "
+            "or extend probly_benchmark.resnet to accept a num_classes arg."
+        )
+        raise ValueError(msg)
+
+    # Augmentation pipelines per the locked CIFAR-10 recipe in
+    # decisions.md "CIFAR-10H training data".
+    train_transforms: list[Any] = [
+        T.RandomCrop(hp["crop_size"], padding=hp["crop_padding"]),
+    ]
+    if hp["horizontal_flip"]:
+        train_transforms.append(T.RandomHorizontalFlip())
+    train_transforms.extend([T.ToTensor(), T.Normalize(hp["mean"], hp["std"])])
+    train_transform = T.Compose(train_transforms)
+    val_transform = T.Compose([T.ToTensor(), T.Normalize(hp["mean"], hp["std"])])
+
+    # CIFAR-10 train. Cached under loader_kwargs['root'] (gitignored
+    # via .gitignore's data/ entry). We instantiate twice -- once with
+    # train-time augmentations, once with eval-only transforms -- and
+    # split the indices via a seeded permutation; the val subset uses
+    # the eval-transform copy so augmentation noise doesn't perturb
+    # val_acc.
+    root = str(config.get("loader_kwargs", {}).get("root", "data/cifar10"))
+    train_ds = torchvision.datasets.CIFAR10(
+        root=root, train=True, transform=train_transform, download=True
     )
-    raise NotImplementedError(msg)
+    val_ds = torchvision.datasets.CIFAR10(
+        root=root, train=True, transform=val_transform, download=False
+    )
+    n = len(train_ds)
+    val_size = max(1, int(0.1 * n))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    val_indices = perm[:val_size].tolist()
+    train_indices = perm[val_size:].tolist()
+    train_subset = torch.utils.data.Subset(train_ds, train_indices)
+    val_subset = torch.utils.data.Subset(val_ds, val_indices)
+
+    pin_memory = torch.cuda.is_available()
+    train_loader = torch.utils.data.DataLoader(
+        train_subset,
+        batch_size=hp["batch_size"],
+        shuffle=True,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_subset,
+        batch_size=hp["batch_size"],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ResNet18().to(device)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=hp["lr"],
+        momentum=hp["momentum"],
+        weight_decay=hp["weight_decay"],
+        nesterov=hp["nesterov"],
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=hp["epochs"])
+    criterion = nn.CrossEntropyLoss()
+
+    log_rows: list[tuple[int, float, float, float, float]] = []
+    for epoch in range(hp["epochs"]):
+        model.train()
+        ep_loss = 0.0
+        ep_correct = 0
+        ep_total = 0
+        for x, y in train_loader:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            bsz = x.size(0)
+            ep_loss += float(loss.detach().item()) * bsz
+            ep_correct += int((logits.argmax(dim=1) == y).sum().item())
+            ep_total += bsz
+        train_loss = ep_loss / max(ep_total, 1)
+        train_acc = ep_correct / max(ep_total, 1)
+
+        model.eval()
+        v_loss = 0.0
+        v_correct = 0
+        v_total = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                logits = model(x)
+                loss = criterion(logits, y)
+                bsz = x.size(0)
+                v_loss += float(loss.item()) * bsz
+                v_correct += int((logits.argmax(dim=1) == y).sum().item())
+                v_total += bsz
+        val_loss = v_loss / max(v_total, 1)
+        val_acc = v_correct / max(v_total, 1)
+
+        scheduler.step()
+        log_rows.append((epoch, train_loss, val_loss, train_acc, val_acc))
+        print(
+            f"epoch {epoch + 1}/{hp['epochs']}: "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"train_acc={train_acc:.4f} val_acc={val_acc:.4f}",
+            flush=True,
+        )
+
+    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    torch.save(state_dict, classifier_path)
+    log_path = run_dir / "training_log.csv"
+    log_path.write_text(
+        "epoch,train_loss,val_loss,train_acc,val_acc\n"
+        + "\n".join(f"{e},{tl:.6f},{vl:.6f},{ta:.6f},{va:.6f}" for e, tl, vl, ta, va in log_rows)
+        + "\n"
+    )
+    hash_sidecar.write_text(config_hash)
+    print(f"trained classifier written to {classifier_path}.")
 
 
 def main(argv: list[str] | None = None) -> int:
