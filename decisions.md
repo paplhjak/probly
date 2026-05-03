@@ -157,6 +157,15 @@ method can be plugged in.
 - `evidential` → probly's `evidential_classification`; for APPA-REAL
   regression-style decompositions, `evidential_regression`.
 
+**ImageNet-ReaL ensemble construction.** Deep Ensembles on ImageNet-ReaL
+uses N independently pretrained classifiers (Lakshminarayanan et al.
+2017's standard form), not a frozen-backbone head ensemble. The N
+checkpoint paths are listed in `configs/datasets/imagenet_real.yaml`
+under `ensemble_classifier_paths`. Acceptable proxies are torchvision
+`ResNet50_Weights.IMAGENET1K_V1` / `V2` plus 3+ timm ResNet-50 variants
+with documented training differences. The exact path list is locked
+separately when checkpoints are assembled (a non-blocking item).
+
 The pipeline accepts any probly method via config; this list is the
 **frozen set for the paper**, not a code restriction.
 
