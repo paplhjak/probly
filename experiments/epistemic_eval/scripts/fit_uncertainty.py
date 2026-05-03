@@ -116,6 +116,73 @@ def _build_head_factory(
     return factory, args
 
 
+def _make_full_network_cifar10h_train_provider(
+    dataset_config: dict[str, Any],
+    batch_size: int = 128,
+) -> FeatureProvider:
+    """Build a real CIFAR-10H training provider for from-scratch ensembles.
+
+    Used by the ensemble path that trains each member from scratch
+    (no ``ensemble_classifier_paths`` and no pretrained checkpoint
+    in the dataset config). Loads CIFAR-10 train via
+    :class:`CIFAR10NoMD5`, one-hot encodes the integer labels so they
+    plug into the soft-label cross-entropy loss in
+    :func:`ensemble._train_member`, and returns a
+    :class:`FeatureProvider` over the full 50k training set.
+    """
+    from torchvision import transforms as T  # noqa: PLC0415
+
+    from experiments.epistemic_eval.datasets.cifar10_canonical import (  # noqa: PLC0415
+        CIFAR10NoMD5,
+    )
+
+    norm = dataset_config["training"]["normalization"]
+    crop = dataset_config["training"]["augmentation"].get("random_crop", {})
+    transforms_list: list[Any] = []
+    if crop:
+        transforms_list.append(T.RandomCrop(int(crop["size"]), padding=int(crop.get("padding", 0))))
+    if dataset_config["training"]["augmentation"].get("horizontal_flip"):
+        transforms_list.append(T.RandomHorizontalFlip())
+    transforms_list.extend([
+        T.ToTensor(),
+        T.Normalize(tuple(float(x) for x in norm["mean"]), tuple(float(x) for x in norm["std"])),
+    ])
+    transform = T.Compose(transforms_list)
+
+    cifar_root = dataset_config.get("loader_kwargs", {}).get("root", "data/cifar10h")
+    train_ds = CIFAR10NoMD5(root=cifar_root, train=True, transform=transform)
+    n = len(train_ds)
+    num_classes = int(dataset_config.get("classifier", {}).get("num_classes", 10))
+    indices = np.arange(n, dtype=np.int64)
+
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        xs: list[torch.Tensor] = []
+        ys: list[int] = []
+        for i in range(start, stop):
+            x, y = train_ds[i]
+            xs.append(x)
+            ys.append(int(y))
+        x_batch = torch.stack(xs, dim=0)
+        # One-hot encode int labels into a (B, K) float tensor so the
+        # soft-label cross-entropy in ensemble._train_member /
+        # mc_dropout._train_mc_dropout_model
+        # (``loss = -(y * log_probs).sum(dim=1).mean()``) gets the
+        # right input dtype + shape.
+        y_batch = torch.zeros(len(ys), num_classes, dtype=torch.float32)
+        y_batch[torch.arange(len(ys)), torch.tensor(ys, dtype=torch.long)] = 1.0
+        batches.append((x_batch, y_batch))
+
+    return FeatureProvider(
+        batches=batches,
+        mode="full_network",
+        feature_dim=None,
+        n_classes=num_classes,
+        indices=indices,
+    )
+
+
 def _make_full_network_stub_provider(
     dataset_config: dict[str, Any],
 ) -> FeatureProvider:
@@ -282,23 +349,52 @@ def main(argv: list[str] | None = None) -> int:
         if head_factory_args is not None:
             method_config_with_args["head_factory_args"] = head_factory_args
     else:
-        # Full-network: load stage 1's classifier (or N classifiers for
-        # ensemble via dataset_config['ensemble_classifier_paths']) and
-        # let the method module wrap with dropout / collect state_dicts.
-        # The provider is a metadata-only stub because the load-pretrained
-        # path doesn't iterate training data; cluster runs will replace
-        # this with a real provider when extract_uncertainties.py runs.
+        # Full-network: three sub-paths, dispatched on the (method,
+        # ensemble_classifier_paths) pair.
+        #
+        # 1. ``ensemble`` + ``ensemble_classifier_paths`` set
+        #    (ImageNet-ReaL): :func:`ensemble.fit` loads the N
+        #    pretrained checkpoints itself; we hand it a stub
+        #    provider and a base factory, no training happens here.
+        # 2. ``ensemble`` without ``ensemble_classifier_paths``
+        #    (CIFAR-10H from-scratch ensembles): each member needs
+        #    independent training with a derived seed, so we build a
+        #    real CIFAR-10H training provider and pass an unwrapped
+        #    base factory (so each ``model_factory()`` call yields a
+        #    freshly initialised model that diverges per
+        #    ``setup_determinism(member_seed)``).
+        # 3. ``mc_dropout`` (and any other "wrap a pretrained classifier"
+        #    method): load stage-1's classifier, wrap the factory with
+        #    its state_dict, and short-circuit training via
+        #    ``epochs = 0``.
         method_name = method_config.get("name")
-        provider = _make_full_network_stub_provider(dataset_config)
         base_factory, _ = _build_full_network_factory(dataset_config)
 
         if method_name == "ensemble" and dataset_config.get("ensemble_classifier_paths"):
-            # ensemble.fit handles ensemble_classifier_paths internally
-            # (no extra wrapping here; factory just needs to produce a
-            # fresh classifier into which each path's state_dict will be
-            # loaded by ensemble.extract).
+            # Path 1.
+            provider = _make_full_network_stub_provider(dataset_config)
+            factory = base_factory
+        elif method_name == "ensemble":
+            # Path 2: from-scratch ensemble training. Currently only
+            # CIFAR-10H is wired through; ImageNet-ReaL is expected to
+            # use the ensemble_classifier_paths path. Fail loudly if
+            # we land here on any other dataset to keep the contract
+            # explicit.
+            if dataset_config.get("name") != "cifar10h":
+                msg = (
+                    f"from-scratch full-network ensemble training is "
+                    f"only wired for CIFAR-10H; got dataset "
+                    f"{dataset_config.get('name')!r}. Either provide "
+                    f"`ensemble_classifier_paths` in the dataset "
+                    f"config or extend fit_uncertainty.py with a "
+                    f"per-dataset training provider."
+                )
+                raise NotImplementedError(msg)
+            provider = _make_full_network_cifar10h_train_provider(dataset_config)
             factory = base_factory
         else:
+            # Path 3.
+            provider = _make_full_network_stub_provider(dataset_config)
             classifier_path = _resolve_classifier_state_dict_path(
                 dataset_config, args.seed, args.classifier_state_dict_path
             )

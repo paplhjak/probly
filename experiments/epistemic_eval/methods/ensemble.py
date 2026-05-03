@@ -84,11 +84,19 @@ def _train_member(
     method_config: dict[str, Any],
     seed: int,
 ) -> nn.Module:
-    """Train a single ensemble member with cross-entropy on soft labels."""
+    """Train a single ensemble member with cross-entropy on soft labels.
+
+    Runs on GPU when one is available; falls back to CPU otherwise.
+    Per-member training of a ResNet-18-class model on CIFAR-10 train
+    is ~50x faster on a consumer GPU than on CPU.
+    """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
     lr = float(method_config.get("lr", 1.0e-3))
     weight_decay = float(method_config.get("weight_decay", 0.0))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -98,6 +106,8 @@ def _train_member(
     model.train()
     for _ in range(epochs):
         for x, y in data_provider:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
             logits = model(x)
             log_probs = torch.log_softmax(logits, dim=1)
             loss = -(y * log_probs).sum(dim=1).mean()
