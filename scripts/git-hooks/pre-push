@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# pre-push hook: only allow pushes to github.com/paplhjak/*.
+# Installed via: ln -sf ../../scripts/git-hooks/pre-push \
+#   .git/hooks/pre-push
+set -euo pipefail
+remote="${1:-}"
+url="${2:-}"
+if [[ -z "$url" ]]; then
+  echo "pre-push: no remote URL provided; refusing push." >&2
+  exit 1
+fi
+# Parse owner from common URL forms:
+#   git@github.com:OWNER/REPO(.git)?
+#   https://github.com/OWNER/REPO(.git)?
+#   ssh://git@github.com/OWNER/REPO(.git)?
+owner=""
+if [[ "$url" =~ ^git@github\.com:([^/]+)/.+$ ]]; then
+  owner="${BASH_REMATCH[1]}"
+elif [[ "$url" =~ ^https://github\.com/([^/]+)/.+$ ]]; then
+  owner="${BASH_REMATCH[1]}"
+elif [[ "$url" =~ ^ssh://git@github\.com/([^/]+)/.+$ ]]; then
+  owner="${BASH_REMATCH[1]}"
+else
+  echo "pre-push: unrecognised remote URL form: $url" >&2
+  echo "pre-push: refusing push for safety." >&2
+  exit 1
+fi
+# Case-insensitive owner check.
+shopt -s nocasematch
+if [[ "$owner" == "paplhjak" ]]; then
+  exit 0
+else
+  echo "pre-push: BLOCKED. Remote owner is '$owner', not paplhjak." >&2
+  echo "pre-push: URL was: $url" >&2
+  exit 1
+fi

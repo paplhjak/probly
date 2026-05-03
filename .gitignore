@@ -299,3 +299,12 @@ data/
 
 # Paper (synced via Overleaf git)
 paper/
+
+# Epistemic-eval (NeurIPS 2026) — APPA-REAL backbone weights
+# Weights are large and provided externally. Keep metadata + READMEs.
+experiments/epistemic_eval/assets/appa_real_backbone/*
+!experiments/epistemic_eval/assets/appa_real_backbone/*.md
+!experiments/epistemic_eval/assets/appa_real_backbone/backbone_meta.yaml
+
+# Epistemic-eval — run outputs (cached predictions, oracle, metrics)
+experiments/epistemic_eval/runs/
