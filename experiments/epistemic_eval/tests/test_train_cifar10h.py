@@ -101,7 +101,10 @@ def test_train_cifar10h_smoke(tmp_path: Path) -> None:
     run_dir.mkdir()
     config = _make_smoke_config(epochs=2, batch_size=8)
 
-    with patch("torchvision.datasets.CIFAR10", _SyntheticCIFAR10):
+    with patch(
+        "experiments.epistemic_eval.datasets.cifar10_canonical.CIFAR10NoMD5",
+        _SyntheticCIFAR10,
+    ):
         _train_cifar10h_run(config, run_dir, seed=0)
 
     classifier_path = run_dir / "classifier.pth"
@@ -130,14 +133,20 @@ def test_train_cifar10h_idempotent(tmp_path: Path) -> None:
     run_dir.mkdir()
     config = _make_smoke_config(epochs=2, batch_size=8)
 
-    with patch("torchvision.datasets.CIFAR10", _SyntheticCIFAR10):
+    with patch(
+        "experiments.epistemic_eval.datasets.cifar10_canonical.CIFAR10NoMD5",
+        _SyntheticCIFAR10,
+    ):
         _train_cifar10h_run(config, run_dir, seed=0)
 
     classifier_path = run_dir / "classifier.pth"
     mtime_first = classifier_path.stat().st_mtime_ns
 
     # Second invocation must be a no-op (same config, same seed).
-    with patch("torchvision.datasets.CIFAR10", _SyntheticCIFAR10):
+    with patch(
+        "experiments.epistemic_eval.datasets.cifar10_canonical.CIFAR10NoMD5",
+        _SyntheticCIFAR10,
+    ):
         _train_cifar10h_run(config, run_dir, seed=0)
     mtime_second = classifier_path.stat().st_mtime_ns
 
@@ -153,7 +162,10 @@ def test_train_cifar10h_rejects_unknown_optimizer(tmp_path: Path) -> None:
     config = _make_smoke_config()
     config["training"]["optimizer"] = "adam"
 
-    with patch("torchvision.datasets.CIFAR10", _SyntheticCIFAR10), pytest.raises(
+    with patch(
+        "experiments.epistemic_eval.datasets.cifar10_canonical.CIFAR10NoMD5",
+        _SyntheticCIFAR10,
+    ), pytest.raises(
         ValueError, match="unknown optimizer"
     ):
         _train_cifar10h_run(config, run_dir, seed=0)
@@ -166,7 +178,10 @@ def test_train_cifar10h_rejects_unknown_schedule(tmp_path: Path) -> None:
     config = _make_smoke_config()
     config["training"]["schedule"] = "step"
 
-    with patch("torchvision.datasets.CIFAR10", _SyntheticCIFAR10), pytest.raises(
+    with patch(
+        "experiments.epistemic_eval.datasets.cifar10_canonical.CIFAR10NoMD5",
+        _SyntheticCIFAR10,
+    ), pytest.raises(
         ValueError, match="unknown schedule"
     ):
         _train_cifar10h_run(config, run_dir, seed=0)
@@ -179,7 +194,10 @@ def test_train_cifar10h_rejects_wrong_num_classes(tmp_path: Path) -> None:
     config = _make_smoke_config()
     config["classifier"]["num_classes"] = 100
 
-    with patch("torchvision.datasets.CIFAR10", _SyntheticCIFAR10), pytest.raises(
+    with patch(
+        "experiments.epistemic_eval.datasets.cifar10_canonical.CIFAR10NoMD5",
+        _SyntheticCIFAR10,
+    ), pytest.raises(
         ValueError, match="hardcoded to 10 classes"
     ):
         _train_cifar10h_run(config, run_dir, seed=0)

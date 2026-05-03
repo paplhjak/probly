@@ -80,6 +80,58 @@ def _head_factory(head_factory_args: dict[str, Any]) -> Any:  # noqa: ANN401
     return factory
 
 
+def _make_full_network_cifar10h_test_provider(
+    dataset_config: dict[str, Any],
+    batch_size: int = 256,
+) -> FeatureProvider:
+    """Build a test-time provider for the CIFAR-10H full-network path.
+
+    Loads the canonical CIFAR-10 test split via :class:`CIFAR10NoMD5`
+    (canonical ordering matches ``cifar10h-counts.npy``), applies the
+    eval-time normalisation declared in the dataset config's
+    ``training.normalization``, and yields ``(image_tensor, label)``
+    batches.
+
+    Labels are integer class indices, which is what
+    :class:`CIFAR10NoMD5` returns natively; the method modules
+    discard them at extract time, so we just keep them as-is.
+    """
+    from torchvision import transforms as T  # noqa: PLC0415
+
+    from experiments.epistemic_eval.datasets.cifar10_canonical import (  # noqa: PLC0415
+        CIFAR10NoMD5,
+    )
+
+    norm = dataset_config["training"]["normalization"]
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize(tuple(float(x) for x in norm["mean"]), tuple(float(x) for x in norm["std"])),
+    ])
+    cifar_root = dataset_config.get("loader_kwargs", {}).get("root", "data/cifar10h")
+    test_ds = CIFAR10NoMD5(root=cifar_root, train=False, transform=transform)
+    n = len(test_ds)
+    indices = np.arange(n, dtype=np.int64)
+    num_classes = int(dataset_config.get("classifier", {}).get("num_classes", 10))
+
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for start in range(0, n, batch_size):
+        stop = min(start + batch_size, n)
+        xs = []
+        ys = []
+        for i in range(start, stop):
+            x, y = test_ds[i]
+            xs.append(x)
+            ys.append(y)
+        batches.append((torch.stack(xs, dim=0), torch.tensor(ys, dtype=torch.long)))
+    return FeatureProvider(
+        batches=batches,
+        mode="full_network",
+        feature_dim=None,
+        n_classes=num_classes,
+        indices=indices,
+    )
+
+
 def _make_test_provider(
     dataset_config: dict[str, Any],
     feature_cache_dir: Path,
@@ -87,22 +139,21 @@ def _make_test_provider(
     """Build a test-time provider from the dataset config.
 
     For linear-probe mode, reads ``data/appa_real_features/test.npz``.
-    For full-network mode, real-data wiring uses the dataset's loader
-    (e.g. ``probly.datasets.torch.CIFAR10H``) on the cluster. The
-    method-module-level extract path is exercised in-process by the
-    Task 5 tests (``test_full_network_{mc_dropout,ensemble}.py``).
+    For full-network CIFAR-10H, loads the canonical-format test split
+    via :class:`CIFAR10NoMD5` and applies the dataset's normalisation
+    transform. ImageNet-ReaL full-network is still cluster-only;
+    raises ``NotImplementedError`` with a clear message there.
     """
     extraction_mode = dataset_config.get("extraction_mode", "full_network")
     if extraction_mode != "linear_probe":
+        if dataset_config.get("name") == "cifar10h":
+            return _make_full_network_cifar10h_test_provider(dataset_config)
         msg = (
-            "Full-network real-data test FeatureProvider construction is a "
-            "cluster-side wiring task (Task 9+); it requires the dataset's "
-            "test split on disk plus the per-architecture preprocessing "
-            "transform. The method-module extract() functions are exercised "
-            "in-process by tests/test_full_network_{mc_dropout,ensemble}.py "
-            "with synthetic providers; that path validates the (N, K, S) "
-            "schema and dropout-vs-ensemble variability without requiring "
-            "real data."
+            f"Full-network test FeatureProvider for dataset "
+            f"{dataset_config.get('name')!r} is not yet wired here. "
+            "Add a per-dataset branch alongside the cifar10h one in "
+            "_make_test_provider, or build a FeatureProvider in-process "
+            "and call extract() directly."
         )
         raise NotImplementedError(msg)
     cache_file = feature_cache_dir / "test.npz"

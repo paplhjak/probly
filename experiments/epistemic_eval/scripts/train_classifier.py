@@ -258,11 +258,25 @@ def _train_cifar10h_run(
             ``num_classes`` does not match the ``ResNet18`` architecture
             (which is hardcoded to 10).
     """
-    # Late imports: keep torchvision and the heavy ResNet18 module out
-    # of the import path of the synthetic-only smoke test.
-    import torchvision  # noqa: PLC0415
+    # Late imports: keep torchvision and the heavy ResNet18 module
+    # out of the import path of the synthetic-only smoke test. The
+    # canonical pickled CIFAR-10 batches at
+    # ``data/cifar10h/cifar-10-batches-py/`` are produced from the
+    # raw PNGs by ``build_canonical_cifar10_pickles.py``; the
+    # canonical Toronto host has been flaking with 503s and the HF
+    # mirrors don't carry the exact tarball, so we materialise the
+    # batches locally. :class:`CIFAR10NoMD5` is a thin subclass of
+    # ``torchvision.datasets.CIFAR10`` that bypasses the canonical
+    # MD5 check (our pickles encode the same image data but are
+    # not byte-identical to the tarball). Test-set ordering follows
+    # canonical CIFAR-10 -- the same ordering ``cifar10h-counts.npy``
+    # uses, so downstream alignment with the human soft labels is
+    # automatic.
     from torchvision import transforms as T  # noqa: PLC0415
 
+    from experiments.epistemic_eval.datasets.cifar10_canonical import (  # noqa: PLC0415
+        CIFAR10NoMD5,
+    )
     from probly_benchmark.resnet import ResNet18  # noqa: PLC0415
 
     classifier_path = run_dir / "classifier.pth"
@@ -299,19 +313,18 @@ def _train_cifar10h_run(
     train_transform = T.Compose(train_transforms)
     val_transform = T.Compose([T.ToTensor(), T.Normalize(hp["mean"], hp["std"])])
 
-    # CIFAR-10 train. Cached under loader_kwargs['root'] (gitignored
-    # via .gitignore's data/ entry). We instantiate twice -- once with
-    # train-time augmentations, once with eval-only transforms -- and
-    # split the indices via a seeded permutation; the val subset uses
-    # the eval-transform copy so augmentation noise doesn't perturb
-    # val_acc.
-    root = str(config.get("loader_kwargs", {}).get("root", "data/cifar10"))
-    train_ds = torchvision.datasets.CIFAR10(
-        root=root, train=True, transform=train_transform, download=True
-    )
-    val_ds = torchvision.datasets.CIFAR10(
-        root=root, train=True, transform=val_transform, download=False
-    )
+    # CIFAR-10 train via the canonical-format pickles. We use the
+    # CIFAR-10H dataset's loader_kwargs.root since both
+    # ``cifar-10-batches-py/`` (training data) and
+    # ``cifar-10h-master/data/cifar10h-counts.npy`` (human soft labels)
+    # live under the same dataset root in the project's data layout.
+    # We instantiate twice -- once with train-time augmentations,
+    # once with eval-only transforms -- and split the indices via a
+    # seeded permutation; the val subset uses the eval-transform
+    # copy so augmentation noise doesn't perturb val_acc.
+    cifar_root = config.get("loader_kwargs", {}).get("root", "data/cifar10h")
+    train_ds = CIFAR10NoMD5(root=cifar_root, train=True, transform=train_transform)
+    val_ds = CIFAR10NoMD5(root=cifar_root, train=True, transform=val_transform)
     n = len(train_ds)
     val_size = max(1, int(0.1 * n))
     rng = np.random.default_rng(seed)
