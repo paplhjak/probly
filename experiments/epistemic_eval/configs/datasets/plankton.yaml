@@ -43,8 +43,8 @@ training:
   lr: 3.0e-4
   weight_decay: 1.0e-4
   batch_size: 32
-  epochs: 200
-  patience: 100
+  epochs: 100
+  patience: 20
   val_fraction: 0.1
   num_workers: 0
   schedule: cosine
@@ -64,7 +64,7 @@ training:
   # lr than AdamW; both are still 30x lower than the CIFAR-10H
   # from-scratch lr=0.1.
   method_overrides:
-    epochs: 200
+    epochs: 100
     lr: 3.0e-3
     momentum: 0.9
     nesterov: false
