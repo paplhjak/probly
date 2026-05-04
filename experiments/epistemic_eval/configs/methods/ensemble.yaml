@@ -20,3 +20,16 @@ n_members: 5
 seed_strategy: derived
 head_dropout_p: 0.1
 classifier_dropout_p: 0.0
+
+# Per-member training hyperparameters. The recipe (SGD + cosine,
+# matching basecls in cifar10h.yaml) is locked across all four UQ
+# methods so the cross-method comparison is recipe-uniform.
+# ``_train_member`` reads ``epochs``, ``lr``, ``momentum``,
+# ``nesterov``, ``weight_decay``; ``schedule`` is documentation only
+# (the wrapper hardcodes CosineAnnealingLR with T_max == epochs).
+epochs: 200
+lr: 0.1
+momentum: 0.9
+nesterov: false
+weight_decay: 5.0e-4
+schedule: cosine

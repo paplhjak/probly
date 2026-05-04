@@ -11,11 +11,20 @@ method_module: experiments.epistemic_eval.methods.evidential_classification
 # field to dispatch to the right per-schema decomposition function.
 output_schema: evidential_alpha
 
-# Training hyperparameters. ``epochs: 200`` matches basecls and
-# ensemble production recipe.
+# Training hyperparameters. The recipe (SGD + cosine, matching
+# basecls in cifar10h.yaml) is locked across all four UQ methods so
+# the cross-method comparison is recipe-uniform. Sensoy 2018 trained
+# the original evidential network with Adam, but the soft-label
+# evidential CE in the wrapper is well-posed under SGD; we picked
+# uniformity over per-method literature alignment. The wrapper reads
+# ``epochs``, ``lr``, ``momentum``, ``nesterov``, ``weight_decay``;
+# ``schedule`` is documentation only.
 epochs: 200
-lr: 1.0e-3
+lr: 0.1
+momentum: 0.9
+nesterov: false
 weight_decay: 5.0e-4
+schedule: cosine
 
 # Sensoy 2018 KL regulariser weight on wrong-class concentrations.
 # 0.0 = no regulariser (the smoke-test variant); the standard recipe

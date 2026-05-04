@@ -83,28 +83,56 @@ def _train_member(
     data_provider: FeatureProvider,
     method_config: dict[str, Any],
     seed: int,
+    *,
+    member_idx: int = 0,
+    n_members: int = 1,
 ) -> nn.Module:
     """Train a single ensemble member with cross-entropy on soft labels.
 
     Runs on GPU when one is available; falls back to CPU otherwise.
     Per-member training of a ResNet-18-class model on CIFAR-10 train
     is ~50x faster on a consumer GPU than on CPU.
+
+    Optimisation recipe (locked across all four UQ methods, mirrors
+    :mod:`scripts.train_classifier`'s basecls path):
+    SGD with momentum (Nesterov configurable) and a cosine learning-
+    rate schedule with ``T_max == epochs``. The choice unifies the
+    method comparison: pre-fix, ensemble/evidential/ddu used AdamW
+    while basecls/mc_dropout used SGD-cosine, making the head-to-head
+    recipe-confounded.
+
+    Per-epoch progress is printed to stdout in the format
+    ``member <idx>/<n> epoch <e>/<E>: train_loss=<float> lr=<float>``
+    so SLURM logs surface training progress and silent-no-op
+    regressions are detectable at a glance. ``lr`` is the LR active
+    during the just-finished epoch (read before stepping the
+    scheduler).
     """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
     lr = float(method_config.get("lr", 1.0e-3))
     weight_decay = float(method_config.get("weight_decay", 0.0))
+    momentum = float(method_config.get("momentum", 0.9))
+    nesterov = bool(method_config.get("nesterov", False))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.SGD(
         [p for p in model.parameters() if p.requires_grad],
         lr=lr,
+        momentum=momentum,
         weight_decay=weight_decay,
+        nesterov=nesterov,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(epochs, 1)
     )
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        lr_now = float(scheduler.get_last_lr()[0])
+        epoch_loss = 0.0
+        n_batches = 0
         for x, y in data_provider:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -114,6 +142,15 @@ def _train_member(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            epoch_loss += float(loss.detach().item())
+            n_batches += 1
+        train_loss = epoch_loss / max(n_batches, 1)
+        print(
+            f"member {member_idx + 1}/{n_members} epoch {epoch + 1}/{epochs}: "
+            f"train_loss={train_loss:.4f} lr={lr_now:.4f}",
+            flush=True,
+        )
+        scheduler.step()
     return model
 
 
@@ -177,10 +214,17 @@ def fit(
                 sd = blob
             state_dicts.append({k: v.detach().cpu() for k, v in sd.items()})
     else:
-        for member_seed in member_seeds:
+        for member_idx, member_seed in enumerate(member_seeds):
             setup_determinism(member_seed)
             model = model_factory()
-            trained = _train_member(model, data_provider, method_config, member_seed)
+            trained = _train_member(
+                model,
+                data_provider,
+                method_config,
+                member_seed,
+                member_idx=member_idx,
+                n_members=n_members,
+            )
             state_dicts.append({k: v.detach().cpu() for k, v in trained.state_dict().items()})
 
     head_factory_args = method_config.get("head_factory_args")

@@ -124,26 +124,51 @@ def _train_evidential_model(
 ) -> nn.Module:
     """Train an evidential-classification model with soft-label evidential CE.
 
-    Reads ``epochs``, ``lr``, ``weight_decay`` from ``method_config``
-    (with the same defaults as :mod:`mc_dropout`).
+    Reads ``epochs``, ``lr``, ``weight_decay``, ``momentum``,
+    ``nesterov`` from ``method_config``.
 
     Runs on GPU when one is available; falls back to CPU otherwise.
+
+    Optimisation recipe (locked across all four UQ methods, mirrors
+    :mod:`scripts.train_classifier`'s basecls path): SGD with momentum
+    and cosine schedule. Sensoy 2018's original implementation uses
+    Adam, but the soft-label evidential CE in :func:`_evidential_ce_soft`
+    is well-posed under SGD; this codebase locks SGD-cosine to keep
+    the cross-method comparison recipe-uniform. See
+    ``decisions.md`` -> "Methods to evaluate" for the rationale.
+
+    Per-epoch progress is printed to stdout in the format
+    ``epoch <e>/<E>: train_loss=<float> lr=<float>`` so SLURM logs
+    surface training progress. The accuracy columns from
+    :mod:`scripts.train_classifier` are omitted because this loop's
+    loss is on Dirichlet concentration parameters rather than class
+    probabilities, so a top-1 accuracy is not directly defined.
     """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
     lr = float(method_config.get("lr", 1.0e-3))
     weight_decay = float(method_config.get("weight_decay", 0.0))
+    momentum = float(method_config.get("momentum", 0.9))
+    nesterov = bool(method_config.get("nesterov", False))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.SGD(
         [p for p in model.parameters() if p.requires_grad],
         lr=lr,
+        momentum=momentum,
         weight_decay=weight_decay,
+        nesterov=nesterov,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(epochs, 1)
     )
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        lr_now = float(scheduler.get_last_lr()[0])
+        epoch_loss = 0.0
+        n_batches = 0
         for x, y in data_provider:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -152,6 +177,15 @@ def _train_evidential_model(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            epoch_loss += float(loss.detach().item())
+            n_batches += 1
+        train_loss = epoch_loss / max(n_batches, 1)
+        print(
+            f"epoch {epoch + 1}/{epochs}: "
+            f"train_loss={train_loss:.4f} lr={lr_now:.4f}",
+            flush=True,
+        )
+        scheduler.step()
     return model
 
 

@@ -12,11 +12,19 @@ method_module: experiments.epistemic_eval.methods.ddu
 output_schema: ddu_probs_density
 
 # Training hyperparameters (Phase A: classifier training under
-# spectral-norm-bounded hidden Linear/Conv2d layers).
-# ``epochs: 200`` matches basecls and ensemble production recipe.
+# spectral-norm-bounded hidden Linear/Conv2d layers). The recipe
+# (SGD + cosine, matching basecls in cifar10h.yaml) is locked across
+# all four UQ methods so the cross-method comparison is
+# recipe-uniform. Mukhoti 2023's published DDU recipe also uses
+# SGD-cosine, so this is literature-aligned. The wrapper reads
+# ``epochs``, ``lr``, ``momentum``, ``nesterov``, ``weight_decay``;
+# ``schedule`` is documentation only.
 epochs: 200
-lr: 1.0e-3
+lr: 0.1
+momentum: 0.9
+nesterov: false
 weight_decay: 5.0e-4
+schedule: cosine
 
 # Mukhoti 2023 spectral-norm Lipschitz coefficient. probly's default
 # is 3.0; the original paper uses 3.0 for ResNet18 on CIFAR.
