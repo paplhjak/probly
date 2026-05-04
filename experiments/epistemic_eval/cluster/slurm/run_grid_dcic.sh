@@ -2,11 +2,11 @@
 #SBATCH --job-name=neurips2026_dcic
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=paplhjak@fel.cvut.cz
-#SBATCH --mem=128gb
+#SBATCH --mem=32gb
 #SBATCH --output=logs/%x_%A-%a.log
 #SBATCH --error=logs/%x_%A-%a.log
-#SBATCH --partition=h200
-#SBATCH --cpus-per-task=8
+#SBATCH --partition=gpufast
+#SBATCH --cpus-per-task=3
 #SBATCH --gres=gpu:1
 #SBATCH --array=0-179
 #
