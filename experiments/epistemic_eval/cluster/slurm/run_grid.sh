@@ -112,7 +112,7 @@ ORACLE_RUN="${ORACLE_CANDIDATES[-1]}"
 # main() ignores it.
 # ---------------------------------------------------------------------
 shopt -s nullglob
-BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED})
+BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED}/classifier.pth)
 shopt -u nullglob
 
 if [[ "${METHOD}" == "mc_dropout" ]]; then
@@ -128,19 +128,15 @@ if [[ "${METHOD}" == "mc_dropout" ]]; then
             --seed "${SEED}"
         # Re-glob now that the run exists.
         shopt -s nullglob
-        BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED})
+        BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED}/classifier.pth)
         shopt -u nullglob
     fi
     if [[ ${#BASECLS_CANDIDATES[@]} -eq 0 ]]; then
-        echo "ERROR: basecls training did not produce a run dir for seed=${SEED}." >&2
+        echo "ERROR: basecls training did not produce classifier.pth for seed=${SEED}." >&2
         exit 1
     fi
-    BASECLS_RUN="${BASECLS_CANDIDATES[-1]}"
-    CLASSIFIER_PATH="${BASECLS_RUN}/classifier.pth"
-    if [[ ! -f "${CLASSIFIER_PATH}" ]]; then
-        echo "ERROR: classifier.pth missing at ${CLASSIFIER_PATH}." >&2
-        exit 1
-    fi
+    CLASSIFIER_PATH="${BASECLS_CANDIDATES[-1]}"
+    BASECLS_RUN="$(dirname "${CLASSIFIER_PATH}")"
 else
     # The from-scratch methods don't need a basecls; pass /dev/null
     # so fit_uncertainty.py's existence check is harmless (the Path-2

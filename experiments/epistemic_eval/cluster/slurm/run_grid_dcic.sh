@@ -187,7 +187,7 @@ ORACLE_RUN="${ORACLE_CANDIDATES[-1]}"
 # from scratch inside fit_uncertainty.py and ignore CLASSIFIER_PATH.
 # ---------------------------------------------------------------------
 shopt -s nullglob
-BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED})
+BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED}/classifier.pth)
 shopt -u nullglob
 
 if [[ "${METHOD}" == "mc_dropout" ]]; then
@@ -198,19 +198,15 @@ if [[ "${METHOD}" == "mc_dropout" ]]; then
             --config "${DATASET_CONFIG}" \
             --seed "${SEED}"
         shopt -s nullglob
-        BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED})
+        BASECLS_CANDIDATES=(experiments/epistemic_eval/runs/*_main_basecls_${DATASET_NAME}_seed${SEED}/classifier.pth)
         shopt -u nullglob
     fi
     if [[ ${#BASECLS_CANDIDATES[@]} -eq 0 ]]; then
-        echo "ERROR: basecls did not produce a run dir for ${DATASET_NAME} seed=${SEED}." >&2
+        echo "ERROR: basecls did not produce classifier.pth for ${DATASET_NAME} seed=${SEED}." >&2
         exit 1
     fi
-    BASECLS_RUN="${BASECLS_CANDIDATES[-1]}"
-    CLASSIFIER_PATH="${BASECLS_RUN}/classifier.pth"
-    if [[ ! -f "${CLASSIFIER_PATH}" ]]; then
-        echo "ERROR: classifier.pth missing at ${CLASSIFIER_PATH}." >&2
-        exit 1
-    fi
+    CLASSIFIER_PATH="${BASECLS_CANDIDATES[-1]}"
+    BASECLS_RUN="$(dirname "${CLASSIFIER_PATH}")"
 else
     BASECLS_RUN="(unused; method retrains from scratch)"
     CLASSIFIER_PATH="/dev/null"
