@@ -57,10 +57,12 @@ def test_dcic_yaml_has_locked_schema(yaml_file: str) -> None:
     num_classes = classifier_cfg.get("num_classes")
     assert isinstance(num_classes, int) and num_classes >= 2, yaml_file
 
-    # Training block must carry the locked AdamW recipe for basecls
-    # plus method_overrides for the from-scratch UQ training path.
+    # Training block must carry the locked AdamW + cosine recipe
+    # for basecls plus method_overrides for the from-scratch UQ
+    # training path.
     training = cfg.get("training") or {}
     assert training.get("optimizer") == "adamw", yaml_file
+    assert training.get("schedule") == "cosine", yaml_file
     for key in ("lr", "weight_decay", "batch_size", "epochs", "patience", "val_fraction"):
         assert key in training, (yaml_file, key)
     overrides = training.get("method_overrides") or {}
@@ -69,25 +71,28 @@ def test_dcic_yaml_has_locked_schema(yaml_file: str) -> None:
 
 
 def test_all_dcic_yamls_share_the_same_recipe() -> None:
-    """All 9 DCIC configs declare the same AdamW basecls recipe + overrides.
+    """All 9 DCIC configs declare the same AdamW + cosine recipe + overrides.
 
-    Pin: cross-DCIC recipe uniformity. If a future PR tunes one
-    dataset's lr or batch size, this test fails so the change is
-    caught and the divergence either reverted or recorded in
-    decisions.md.
+    Pin: cross-DCIC recipe uniformity. The values were tuned from
+    the QualityMRI smoke-test findings (lr=1e-3 was too aggressive;
+    20 epochs left the model under-converged; patience=4 fired on
+    noisy 25-image val_loss). If a future PR tunes one dataset's
+    hyperparameters, this test fails so the change is either
+    reverted or recorded in decisions.md.
     """
     canonical_basecls = {
         "optimizer": "adamw",
-        "lr": 1.0e-3,
+        "lr": 3.0e-4,
         "weight_decay": 1.0e-4,
         "batch_size": 32,
-        "epochs": 20,
-        "patience": 4,
+        "epochs": 200,
+        "patience": 100,
         "val_fraction": 0.1,
+        "schedule": "cosine",
     }
     canonical_overrides = {
-        "epochs": 20,
-        "lr": 1.0e-3,
+        "epochs": 200,
+        "lr": 3.0e-3,
         "momentum": 0.9,
         "nesterov": False,
         "weight_decay": 1.0e-4,

@@ -464,6 +464,24 @@ def main(argv: list[str] | None = None) -> int:
                     num_workers=int(training_block.get("num_workers", 0)),
                     augment=True,
                 )
+                # Guard against the config/data num_classes mismatch
+                # that bit MiceBone (DCIC README said 4, the data has
+                # 3). The wrapper's training loop multiplies (B, K)
+                # soft labels by (B, K) log-probs; a mismatch crashes
+                # at the first batch. The loader's n_classes is
+                # derived from the unique labels in annotations.json.
+                declared_num_classes = int(
+                    dataset_config.get("classifier", {}).get("num_classes", 0)
+                )
+                if int(provider.n_classes) != declared_num_classes:
+                    msg = (
+                        f"DCIC dataset {dataset_name!r}: classifier.num_classes="
+                        f"{declared_num_classes} disagrees with the loader's "
+                        f"n_classes={provider.n_classes} (unique labels in "
+                        f"annotations.json). Fix the dataset YAML so the head "
+                        f"matches the data."
+                    )
+                    raise ValueError(msg)
             else:
                 msg = (
                     f"from-scratch full-network training for method "

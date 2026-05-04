@@ -425,11 +425,13 @@ def _read_dcic_training_hparams(config: dict[str, Any]) -> dict[str, Any]:
     """Extract the DCIC training hyperparameters from a dataset config.
 
     DCIC datasets share a single fine-tuning recipe (AdamW + cosine
-    or step schedule, 20 epochs with early stopping on a 10% val
-    split) inherited from
-    :mod:`experiments.first_order_data.dcic_ensemble_pipeline`. This
-    helper parses the locked block and surfaces typed values; it
-    raises on unknown values rather than silently falling back.
+    schedule, 50 epochs with early stopping on a 10% val split,
+    patience 10). The recipe was tuned from QualityMRI smoke-test
+    findings: lr=1e-3 was too aggressive (val_loss spiked at epoch 2),
+    20 epochs left the model under-converged, and patience=4 fired
+    on noisy val_loss from a 25-image val set. This helper parses
+    the locked block and surfaces typed values; it raises on unknown
+    optimizer / schedule values rather than silently falling back.
     """
     training = config["training"]
     optimizer_name = str(training["optimizer"])
@@ -439,14 +441,22 @@ def _read_dcic_training_hparams(config: dict[str, Any]) -> dict[str, Any]:
             f"'adamw' is supported (the locked recipe)."
         )
         raise ValueError(msg)
+    schedule = str(training.get("schedule", "cosine"))
+    if schedule != "cosine":
+        msg = (
+            f"unknown schedule {schedule!r} for DCIC; only 'cosine' "
+            f"is supported (the locked recipe)."
+        )
+        raise ValueError(msg)
     return {
         "lr": float(training["lr"]),
         "weight_decay": float(training["weight_decay"]),
         "batch_size": int(training["batch_size"]),
         "epochs": int(training["epochs"]),
-        "patience": int(training.get("patience", 4)),
+        "patience": int(training.get("patience", 10)),
         "val_fraction": float(training.get("val_fraction", 0.1)),
         "num_workers": int(training.get("num_workers", 0)),
+        "schedule": schedule,
         "horizontal_flip": bool(training.get("augmentation", {}).get("horizontal_flip", True)),
     }
 
@@ -506,12 +516,38 @@ def _train_dcic_run(
         num_workers=hp["num_workers"],
     )
 
+    # Hard guard against the config/data mismatch that bit MiceBone
+    # (the DCIC README table claimed 4 classes but the annotations
+    # only carry 3, so a (B, 4) head against (B, 3) soft labels
+    # crashed at the first batch). The loader's ``n_classes`` is
+    # derived from the unique labels actually present in
+    # ``annotations.json``; if the YAML disagrees, fix the YAML.
+    if int(train_provider.n_classes) != num_classes:
+        msg = (
+            f"DCIC dataset config declares classifier.num_classes="
+            f"{num_classes} but the loader observes "
+            f"n_classes={train_provider.n_classes} unique labels in "
+            f"annotations.json. Fix classifier.num_classes (and "
+            f"metadata.num_classes) in the dataset YAML so the head "
+            f"matches the data."
+        )
+        raise ValueError(msg)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = make_resnet18_factory(num_classes=num_classes, pretrained=True)().to(device)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=hp["lr"],
         weight_decay=hp["weight_decay"],
+    )
+    # Cosine LR schedule over the full epoch budget. The
+    # ``CosineAnnealingLR`` formula decays smoothly from ``lr`` to ~0
+    # across ``T_max`` epochs; combined with ``patience``-based early
+    # stopping this means a run that early-stops keeps the higher-lr
+    # checkpoint while a run that goes the full distance benefits
+    # from the smaller end-of-cosine lr.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(hp["epochs"], 1)
     )
 
     log_rows: list[tuple[int, float, float, float, float]] = []
@@ -520,6 +556,11 @@ def _train_dcic_run(
     epochs_without_improvement = 0
 
     for epoch in range(hp["epochs"]):
+        # Read the LR active during the epoch we're about to run
+        # before stepping; ``scheduler.get_last_lr()`` reports the
+        # most recently set LR (the initial ``lr`` before any
+        # ``scheduler.step()`` calls).
+        lr_now = float(scheduler.get_last_lr()[0])
         model.train()
         ep_loss = 0.0
         ep_correct = 0
@@ -562,7 +603,8 @@ def _train_dcic_run(
         print(
             f"epoch {epoch + 1}/{hp['epochs']}: "
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"train_acc={train_acc:.4f} val_acc={val_acc:.4f}",
+            f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} "
+            f"lr={lr_now:.5f}",
             flush=True,
         )
 
@@ -581,6 +623,11 @@ def _train_dcic_run(
                     flush=True,
                 )
                 break
+
+        # Step the scheduler once per epoch (after early-stopping
+        # bookkeeping so a run that early-stops doesn't advance the
+        # cosine past the epoch we actually trained).
+        scheduler.step()
 
     if best_state is None:
         # Fall through to the post-final-epoch state if validation never

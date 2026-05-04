@@ -206,23 +206,39 @@ second path component, e.g. `Plankton/part1/img.png`).
 
 ### Training recipe
 
-Two recipes apply, separated by which classifier is being trained:
+Two recipes apply, separated by which classifier is being trained.
+Both were tuned from a QualityMRI smoke-test (310 images, 60 test,
+25 val): the initial AdamW lr=1e-3 was too aggressive (val_loss
+spiked at epoch 2), 20 epochs left the model under-converged, and
+patience=4 fired on noisy val_loss from a tiny val set. The locked
+values below absorb that noise and let cosine LR settle the
+fine-tune.
 
-1. **basecls** (used by mc_dropout): AdamW, lr=1e-3, weight_decay=1e-4,
-   batch_size=32, 20 epochs, early stopping with patience 4 on a 10%
-   val split. Mirrors Oleg's defaults in
-   `experiments/first_order_data/run_dcic_ensemble.py:30-47`.
+1. **basecls** (used by mc_dropout): AdamW, lr=3e-4, weight_decay=1e-4,
+   batch_size=32, 200 epochs, **cosine LR schedule** with
+   ``T_max=epochs``, early stopping with patience 100 on a 10% val
+   split. Patience is set to half the epoch budget so early stopping
+   acts only as a safety net against catastrophic divergence rather
+   than as the principal stopping criterion — best-val-loss
+   checkpointing keeps whichever epoch generalised best regardless
+   of how long the cosine tail runs. Diverges from Oleg's
+   `experiments/first_order_data/run_dcic_ensemble.py:30-47`
+   defaults (lr=1e-3, 20 epochs, patience 4) — the divergence is
+   intentional and documented here.
 
 2. **From-scratch UQ training** (ensemble per-member, evidential,
    ddu): the method wrappers are SGD-locked per the cross-method
    recipe-uniformity decision (see "Methods to evaluate"). The DCIC
    dataset config provides `training.method_overrides` with tuned
-   hyperparameters (lr=1e-3, momentum=0.9, weight_decay=1e-4, 20
-   epochs) so SGD fine-tunes from ImageNet weights without
-   destroying them. The optimizer choice differs from basecls
-   (SGD vs. AdamW) by design: cross-method comparison within DCIC
-   stays uniform (all four UQ methods use the same training recipe
-   on the same dataset).
+   hyperparameters (lr=3e-3, momentum=0.9, weight_decay=1e-4, 200
+   epochs, cosine via the wrapper's ``CosineAnnealingLR``) so SGD
+   fine-tunes from ImageNet weights without destroying them. The
+   SGD lr is 10x the AdamW basecls lr (3e-3 vs. 3e-4) because SGD
+   typically wants a higher lr than AdamW; both are still 30x lower
+   than the CIFAR-10H from-scratch lr=0.1. The optimizer choice
+   differs from basecls (SGD vs. AdamW) by design: cross-method
+   comparison within DCIC stays uniform (all four UQ methods use
+   the same training recipe on the same dataset).
 
 ### Class label ordering
 

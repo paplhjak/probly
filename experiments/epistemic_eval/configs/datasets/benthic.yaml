@@ -23,18 +23,19 @@ classifier:
   num_classes: 8
 training:
   optimizer: adamw
-  lr: 1.0e-3
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   batch_size: 32
-  epochs: 20
-  patience: 4
+  epochs: 200
+  patience: 100
   val_fraction: 0.1
-  num_workers: 4
+  num_workers: 0
+  schedule: cosine
   augmentation:
     horizontal_flip: true
   method_overrides:
-    epochs: 20
-    lr: 1.0e-3
+    epochs: 200
+    lr: 3.0e-3
     momentum: 0.9
     nesterov: false
     weight_decay: 1.0e-4

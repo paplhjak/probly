@@ -103,16 +103,32 @@ def _support_fingerprint(support: np.ndarray | None) -> str:
     return hashlib.blake2b(arr.tobytes() + str(arr.dtype).encode(), digest_size=8).hexdigest()
 
 
+def _p_star_fingerprint(p_star_path: Path) -> str:
+    """Return a short hex digest of the input ``p_star.npz``'s file bytes.
+
+    Hashing the raw bytes of the input sidecar makes the oracle cache
+    content-addressable: if a caller passes a different ``p_star``
+    (e.g. because the DCIC test fold rotates per seed and each seed
+    builds its own ``p_star_seed<N>.npz``), the digest changes and
+    the cache invalidates. Without this, two seeds with the same
+    dataset name but different test sets would silently share an
+    oracle.
+    """
+    return hashlib.blake2b(p_star_path.read_bytes(), digest_size=8).hexdigest()
+
+
 def _per_loss_hash(
     dataset_name: str,
     loss: str,
     support: np.ndarray | None,
+    p_star_fingerprint: str,
 ) -> str:
-    """Stable hash of (dataset, loss, support, oracle version)."""
+    """Stable hash of (dataset, loss, support, p_star, oracle version)."""
     payload = {
         "dataset": dataset_name,
         "loss": loss,
         "support_fingerprint": _support_fingerprint(support),
+        "p_star_fingerprint": p_star_fingerprint,
         "oracle_version": int(_ORACLE_VERSION),
     }
     return hash_config(payload)
@@ -121,16 +137,20 @@ def _per_loss_hash(
 def _p_star_sidecar_hash(
     dataset_name: str,
     support: np.ndarray | None,
+    p_star_fingerprint: str,
 ) -> str:
     """Loss-independent hash for the ``p_star.npz`` sidecar.
 
     The sidecar is shared across all losses (it carries only ``p*``,
-    the support, and the row indices), so its hash covers only the
-    dataset, the support fingerprint, and the oracle version.
+    the support, and the row indices). Its hash covers the dataset,
+    the support, the input ``p_star`` content, and the oracle
+    version, so a fresh p_star (different seed -> different test
+    fold for DCIC) invalidates the cached sidecar.
     """
     payload = {
         "dataset": dataset_name,
         "support_fingerprint": _support_fingerprint(support),
+        "p_star_fingerprint": p_star_fingerprint,
         "oracle_version": int(_ORACLE_VERSION),
     }
     return hash_config(payload)
@@ -192,6 +212,19 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=_REPO_ROOT / "experiments" / "epistemic_eval" / "runs",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help=(
+            "Run seed; used to name the oracle run dir "
+            "(``<date>_main_oracle_<dataset>_seed<N>``). For datasets "
+            "whose test set is fixed across seeds (CIFAR-10H, "
+            "ImageNet-ReaL) this is conventionally 0; for DCIC the test "
+            "fold rotates per seed via dcic.pick_test_fold so each "
+            "seed needs its own oracle run dir."
+        ),
+    )
     parser.add_argument("--force-recompute", action="store_true")
     args = parser.parse_args(argv)
 
@@ -214,13 +247,16 @@ def main(argv: list[str] | None = None) -> int:
     support = _resolve_support(dataset_config, blob_support, k)
     if indices is None:
         indices = np.arange(n, dtype=np.int64)
+    p_star_fingerprint = _p_star_fingerprint(args.p_star_path)
 
-    run_dir = args.output_root / make_run_id("oracle", dataset_name, seed=0)
+    run_dir = args.output_root / make_run_id(
+        "oracle", dataset_name, seed=int(args.seed)
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     per_loss_hashes: dict[str, str] = {}
     for loss in supported_losses:
-        loss_hash = _per_loss_hash(dataset_name, str(loss), support)
+        loss_hash = _per_loss_hash(dataset_name, str(loss), support, p_star_fingerprint)
         per_loss_hashes[loss] = loss_hash
         cache_file = run_dir / f"oracle_{loss}.npz"
         sidecar = run_dir / f"oracle_{loss}.config_hash"
@@ -243,7 +279,7 @@ def main(argv: list[str] | None = None) -> int:
     # per dataset so downstream metric computation doesn't need to
     # re-derive p* from dataset configs. The hash is loss-independent;
     # it covers dataset_name, support fingerprint, and _ORACLE_VERSION.
-    sidecar_hash = _p_star_sidecar_hash(dataset_name, support)
+    sidecar_hash = _p_star_sidecar_hash(dataset_name, support, p_star_fingerprint)
     sidecar_path = run_dir / "p_star.npz"
     sidecar_hash_path = run_dir / "p_star.config_hash"
     if (
