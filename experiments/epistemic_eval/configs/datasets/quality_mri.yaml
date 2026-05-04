@@ -1,0 +1,48 @@
+# QualityMRI dataset config (DCIC family).
+#
+# QualityMRI is a binary MRI quality assessment task (good / bad),
+# 310 images at 224x224 native resolution with multi-rater soft
+# labels (DCIC release per Schmarje et al. 2022). The dataset is
+# very small (310 images) and the task is binary -- the
+# (A_hat, E_hat) decomposition has limited resolving power here, but
+# we include it for completeness so all DCIC datasets are covered.
+# See decisions.md "DCIC datasets" for the locked recipe.
+
+name: quality_mri
+family: dcic
+loader:
+  module: probly.datasets.torch
+  class: QualityMRI
+  dcic_name: QualityMRI
+loader_kwargs:
+  root: data
+supported_losses: [cross_entropy, zero_one]
+extraction_mode: full_network
+classifier:
+  architecture: torchvision.models.resnet18
+  pretrained: true
+  pretrained_classifier_path: null
+  num_classes: 2
+training:
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 32
+  epochs: 20
+  patience: 4
+  val_fraction: 0.1
+  num_workers: 4
+  augmentation:
+    horizontal_flip: true
+  method_overrides:
+    epochs: 20
+    lr: 1.0e-3
+    momentum: 0.9
+    nesterov: false
+    weight_decay: 1.0e-4
+metadata:
+  num_classes: 2
+  notes: >-
+    DCIC QualityMRI release (Zenodo records/7180818). Native 224x224;
+    no upscale. Only 310 images total, so the test fold has ~62
+    images. Test fold rotates per seed.

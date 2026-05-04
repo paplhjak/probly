@@ -1,0 +1,46 @@
+# Turkey dataset config (DCIC family).
+#
+# Turkey consists of farm imagery for turkey injury classification,
+# 3-class severity, ~8 040 images at 192x192 native resolution with
+# multi-rater soft labels (DCIC release per Schmarje et al. 2022).
+# See decisions.md "DCIC datasets" for the locked recipe shared
+# across all DCIC datasets in this paper.
+
+name: turkey
+family: dcic
+loader:
+  module: probly.datasets.torch
+  class: Turkey
+  dcic_name: Turkey
+loader_kwargs:
+  root: data
+supported_losses: [cross_entropy, zero_one]
+extraction_mode: full_network
+classifier:
+  architecture: torchvision.models.resnet18
+  pretrained: true
+  pretrained_classifier_path: null
+  num_classes: 3
+training:
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 32
+  epochs: 20
+  patience: 4
+  val_fraction: 0.1
+  num_workers: 4
+  augmentation:
+    horizontal_flip: true
+  method_overrides:
+    epochs: 20
+    lr: 1.0e-3
+    momentum: 0.9
+    nesterov: false
+    weight_decay: 1.0e-4
+metadata:
+  num_classes: 3
+  notes: >-
+    DCIC Turkey release (Zenodo records/7180818). Native 192x192;
+    upscaled to 224x224 by the DCIC adapter. Test fold rotates per
+    seed.

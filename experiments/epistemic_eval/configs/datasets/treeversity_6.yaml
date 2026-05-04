@@ -1,0 +1,50 @@
+# Treeversity#6 dataset config (DCIC family).
+#
+# Treeversity#6 is plant-species classification with possibly
+# multiple labels per image, 6-class, ~9 826 images at 224x224
+# native resolution with multi-rater soft labels (DCIC release per
+# Schmarje et al. 2022). The high average non-zero-target count
+# (3.11 vs. 1.68 for #1) makes this the dataset that most strongly
+# exercises the framework's claim that p* is genuinely a
+# distribution rather than a one-hot. See decisions.md "DCIC
+# datasets" for the locked recipe.
+
+name: treeversity_6
+family: dcic
+loader:
+  module: probly.datasets.torch
+  class: Treeversity6
+  dcic_name: "Treeversity#6"
+loader_kwargs:
+  root: data
+supported_losses: [cross_entropy, zero_one]
+extraction_mode: full_network
+classifier:
+  architecture: torchvision.models.resnet18
+  pretrained: true
+  pretrained_classifier_path: null
+  num_classes: 6
+training:
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 32
+  epochs: 20
+  patience: 4
+  val_fraction: 0.1
+  num_workers: 4
+  augmentation:
+    horizontal_flip: true
+  method_overrides:
+    epochs: 20
+    lr: 1.0e-3
+    momentum: 0.9
+    nesterov: false
+    weight_decay: 1.0e-4
+metadata:
+  num_classes: 6
+  notes: >-
+    DCIC Treeversity#6 release (Zenodo records/7180818). Native
+    224x224. Multi-label variant (avg. non-zero target classes
+    3.11). Strongest exercise of the soft-label p* claim. Test fold
+    rotates per seed.

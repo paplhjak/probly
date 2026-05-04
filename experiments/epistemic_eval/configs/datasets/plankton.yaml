@@ -1,0 +1,74 @@
+# Plankton dataset config (DCIC family).
+#
+# Plankton is a 10-class classification task on plankton microscope
+# images, ~12.3k images at 96x96 native resolution, with multi-rater
+# soft labels (DCIC release per Schmarje et al. 2022). See
+# decisions.md "DCIC datasets" for the locked recipe shared across
+# all DCIC datasets in this paper.
+#
+# Wiring contract:
+#   - ``family: dcic`` triggers the DCIC training branch in
+#     train_classifier.py (AdamW + early stopping) and the DCIC
+#     train/test provider branches in fit_uncertainty.py and
+#     extract_uncertainties.py.
+#   - ``loader.dcic_name`` is the canonical name the DCIC release
+#     uses on disk (case- and spelling-sensitive; the loader at
+#     ``probly.datasets.torch.Plankton`` joins
+#     ``loader_kwargs.root / "Plankton" / "annotations.json"``).
+#   - ``training.method_overrides`` overrides the SGD-cosine recipe
+#     locked in the method YAMLs (ensemble.yaml etc.) with the
+#     DCIC-uniform AdamW recipe so ensemble / evidential / ddu all
+#     fine-tune from ImageNet weights with comparable hyperparameters.
+
+name: plankton
+family: dcic
+loader:
+  module: probly.datasets.torch
+  class: Plankton
+  dcic_name: Plankton
+loader_kwargs:
+  root: data
+supported_losses: [cross_entropy, zero_one]
+extraction_mode: full_network
+classifier:
+  # Resolved by fit_uncertainty.py's _build_full_network_factory via
+  # the family=dcic branch -> make_resnet18_factory(num_classes,
+  # pretrained=True). Listed here for documentation only.
+  architecture: torchvision.models.resnet18
+  pretrained: true
+  pretrained_classifier_path: null
+  num_classes: 10
+training:
+  optimizer: adamw
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 32
+  epochs: 20
+  patience: 4
+  val_fraction: 0.1
+  num_workers: 4
+  augmentation:
+    horizontal_flip: true
+  # Overrides applied to the method config at fit time. The UQ
+  # wrappers (ensemble/_train_member, evidential/_train_evidential_model,
+  # ddu/_train_ddu_classifier) are SGD-locked per the cross-method
+  # recipe-uniformity decision in decisions.md "Methods to evaluate";
+  # this override does not change the optimizer, only its
+  # hyperparameters. The basecls (used by mc_dropout) trains with
+  # AdamW per ``training.optimizer: adamw`` above; the from-scratch
+  # UQ method training paths (ensemble per-member, evidential, ddu)
+  # use SGD with these tuned-down hyperparameters because lr=0.1 is
+  # destructive on ImageNet-pretrained weights.
+  method_overrides:
+    epochs: 20
+    lr: 1.0e-3
+    momentum: 0.9
+    nesterov: false
+    weight_decay: 1.0e-4
+metadata:
+  num_classes: 10
+  notes: >-
+    DCIC Plankton release (Zenodo records/7180818). Native resolution
+    96x96; the DCIC adapter resizes to 224x224 to match the
+    torchvision ResNet-18 input. Test fold is rotated per seed via
+    test_fold_for_seed: seed N -> sorted_folds[N % 5].
