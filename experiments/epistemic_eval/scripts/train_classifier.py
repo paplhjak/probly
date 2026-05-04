@@ -421,6 +421,188 @@ def _train_cifar10h_run(
     print(f"trained classifier written to {classifier_path}.")
 
 
+def _read_dcic_training_hparams(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract the DCIC training hyperparameters from a dataset config.
+
+    DCIC datasets share a single fine-tuning recipe (AdamW + cosine
+    or step schedule, 20 epochs with early stopping on a 10% val
+    split) inherited from
+    :mod:`experiments.first_order_data.dcic_ensemble_pipeline`. This
+    helper parses the locked block and surfaces typed values; it
+    raises on unknown values rather than silently falling back.
+    """
+    training = config["training"]
+    optimizer_name = str(training["optimizer"])
+    if optimizer_name != "adamw":
+        msg = (
+            f"unknown optimizer {optimizer_name!r} for DCIC; only "
+            f"'adamw' is supported (the locked recipe)."
+        )
+        raise ValueError(msg)
+    return {
+        "lr": float(training["lr"]),
+        "weight_decay": float(training["weight_decay"]),
+        "batch_size": int(training["batch_size"]),
+        "epochs": int(training["epochs"]),
+        "patience": int(training.get("patience", 4)),
+        "val_fraction": float(training.get("val_fraction", 0.1)),
+        "num_workers": int(training.get("num_workers", 0)),
+        "horizontal_flip": bool(training.get("augmentation", {}).get("horizontal_flip", True)),
+    }
+
+
+def _train_dcic_run(
+    config: dict[str, Any],
+    run_dir: Path,
+    seed: int,
+) -> None:
+    """Train a DCIC base classifier with the locked AdamW recipe.
+
+    Steps:
+
+    1. Resolve the seed's test fold via
+       :func:`experiments.epistemic_eval.datasets.dcic.test_fold_for_seed`
+       and build (train, val) :class:`FeatureProvider` over the four
+       non-test folds with a 10% val carve-out (per
+       ``decisions.md`` -> "DCIC datasets" and Oleg's reference recipe
+       in :mod:`experiments.first_order_data.dcic_ensemble_pipeline`).
+    2. Build a fresh torchvision ResNet-18 with ImageNet weights and
+       a K-class linear head via
+       :func:`experiments.epistemic_eval.datasets.dcic.make_resnet18_factory`.
+    3. Train with AdamW + soft-label cross-entropy. Early-stop on val
+       loss with patience ``training.patience`` (default 4).
+    4. Persist the best (lowest-val-loss) state_dict as
+       ``classifier.pth`` and dump per-epoch metrics to
+       ``training_log.csv``.
+
+    Idempotent: if ``classifier.pth`` exists with a matching
+    ``classifier.config_hash`` sidecar, return without retraining.
+    """
+    from experiments.epistemic_eval.datasets.dcic import (  # noqa: PLC0415
+        build_train_val_providers,
+        make_resnet18_factory,
+    )
+
+    classifier_path = run_dir / "classifier.pth"
+    hash_sidecar = run_dir / "classifier.config_hash"
+    config_hash = hash_config(config)
+    if (
+        classifier_path.exists()
+        and hash_sidecar.exists()
+        and hash_sidecar.read_text().strip() == config_hash
+    ):
+        print(f"skipped: classifier exists at {classifier_path}.")
+        return
+
+    setup_determinism(seed)
+    hp = _read_dcic_training_hparams(config)
+    num_classes = int(config["classifier"]["num_classes"])
+
+    train_provider, val_provider = build_train_val_providers(
+        config,
+        seed=seed,
+        val_fraction=hp["val_fraction"],
+        batch_size=hp["batch_size"],
+        num_workers=hp["num_workers"],
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = make_resnet18_factory(num_classes=num_classes, pretrained=True)().to(device)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=hp["lr"],
+        weight_decay=hp["weight_decay"],
+    )
+
+    log_rows: list[tuple[int, float, float, float, float]] = []
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    epochs_without_improvement = 0
+
+    for epoch in range(hp["epochs"]):
+        model.train()
+        ep_loss = 0.0
+        ep_correct = 0
+        ep_total = 0
+        for x, y in train_provider:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(x)
+            log_probs = torch.log_softmax(logits, dim=1)
+            loss = -(y * log_probs).sum(dim=1).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            bsz = x.size(0)
+            ep_loss += float(loss.detach().item()) * bsz
+            ep_correct += int((logits.argmax(dim=1) == y.argmax(dim=1)).sum().item())
+            ep_total += bsz
+        train_loss = ep_loss / max(ep_total, 1)
+        train_acc = ep_correct / max(ep_total, 1)
+
+        model.eval()
+        v_loss = 0.0
+        v_correct = 0
+        v_total = 0
+        with torch.no_grad():
+            for x, y in val_provider:
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
+                logits = model(x)
+                log_probs = torch.log_softmax(logits, dim=1)
+                loss = -(y * log_probs).sum(dim=1).mean()
+                bsz = x.size(0)
+                v_loss += float(loss.item()) * bsz
+                v_correct += int((logits.argmax(dim=1) == y.argmax(dim=1)).sum().item())
+                v_total += bsz
+        val_loss = v_loss / max(v_total, 1)
+        val_acc = v_correct / max(v_total, 1)
+
+        log_rows.append((epoch, train_loss, val_loss, train_acc, val_acc))
+        print(
+            f"epoch {epoch + 1}/{hp['epochs']}: "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"train_acc={train_acc:.4f} val_acc={val_acc:.4f}",
+            flush=True,
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= hp["patience"]:
+                print(
+                    f"early stopping at epoch {epoch + 1}/{hp['epochs']} "
+                    f"(no val_loss improvement in {hp['patience']} epochs).",
+                    flush=True,
+                )
+                break
+
+    if best_state is None:
+        # Fall through to the post-final-epoch state if validation never
+        # produced a finite loss; this should never happen in practice
+        # but keeps the function from silently writing nothing.
+        best_state = {
+            k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+        }
+    torch.save(best_state, classifier_path)
+    log_path = run_dir / "training_log.csv"
+    log_path.write_text(
+        "epoch,train_loss,val_loss,train_acc,val_acc\n"
+        + "\n".join(
+            f"{e},{tl:.6f},{vl:.6f},{ta:.6f},{va:.6f}"
+            for e, tl, vl, ta, va in log_rows
+        )
+        + "\n"
+    )
+    hash_sidecar.write_text(config_hash)
+    print(f"trained DCIC classifier written to {classifier_path}.")
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point. See module docstring."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -492,6 +674,18 @@ def main(argv: list[str] | None = None) -> int:
             "appa_real does not use train_classifier.py; use extract_features.py "
             "to cache backbone features for the linear-probe path."
         )
+        return 0
+
+    if config.get("family") == "dcic":
+        # DCIC datasets dispatch to the AdamW + early-stopping recipe
+        # in :func:`_train_dcic_run`. The seed picks the test fold via
+        # :mod:`experiments.epistemic_eval.datasets.dcic.test_fold_for_seed`
+        # so each seed exercises a different held-out fold.
+        if pretrained_path is not None:
+            _stage_pretrained(Path(pretrained_path), run_dir)
+            print(f"skipped: pretrained provided ({pretrained_path})")
+            return 0
+        _train_dcic_run(config, run_dir, args.seed)
         return 0
 
     print(f"unknown dataset name: {name!r}", file=sys.stderr)

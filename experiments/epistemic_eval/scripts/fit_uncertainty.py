@@ -88,7 +88,25 @@ def _build_full_network_factory(
 
     Returns ``(factory, head_factory_args)``. ``head_factory_args`` is
     ``None`` because the architecture is the full classifier.
+
+    DCIC datasets (``family == "dcic"``) take a dedicated path that
+    constructs a torchvision ``resnet18`` with ImageNet-pretrained
+    weights and a fresh K-class linear head, mirroring Oleg's
+    reference :class:`ImageEntmaxClassifier` recipe. Other datasets
+    use the dataset-config-driven architecture spec.
     """
+    if dataset_config.get("family") == "dcic":
+        from experiments.epistemic_eval.datasets.dcic import (  # noqa: PLC0415
+            make_resnet18_factory,
+        )
+
+        classifier_cfg = dataset_config.get("classifier", {})
+        num_classes = int(classifier_cfg.get("num_classes", 0))
+        pretrained = bool(classifier_cfg.get("pretrained", True))
+        return make_resnet18_factory(
+            num_classes=num_classes, pretrained=pretrained
+        ), None
+
     classifier_cfg = dataset_config.get("classifier", {})
     arch = classifier_cfg["architecture"]
     cls_or_fn = _resolve_callable(arch)
@@ -368,6 +386,21 @@ def main(argv: list[str] | None = None) -> int:
 
     method_config_with_args = dict(method_config)
 
+    # Dataset-driven recipe override: a dataset config can declare
+    # ``training.method_overrides`` (e.g. DCIC datasets with the
+    # AdamW fine-tune recipe vs CIFAR-10H's SGD-cosine from-scratch
+    # recipe). This is the documented bridge between cross-method
+    # recipe uniformity (the locked recipe in the method YAMLs) and
+    # cross-dataset recipe variation (a 224x224 ImageNet-pretrained
+    # backbone needs different hyperparameters than a 32x32
+    # from-scratch CIFAR ResNet). Unknown keys are passed through;
+    # the wrappers ignore anything they don't read.
+    method_overrides = (
+        dataset_config.get("training", {}).get("method_overrides", {}) or {}
+    )
+    if method_overrides:
+        method_config_with_args.update(dict(method_overrides))
+
     if extraction_mode == "linear_probe":
         factory, head_factory_args = _build_head_factory(dataset_config, method_config)
         provider = _make_linear_probe_provider(
@@ -410,20 +443,37 @@ def main(argv: list[str] | None = None) -> int:
             # training; evidential: classifier training under the
             # evidential CE loss; ddu: Phase A classifier training
             # + Phase B GMM density-head fit on encoder features).
-            # Only CIFAR-10H is wired; ImageNet-ReaL is expected to
-            # use the ensemble_classifier_paths path with one of the
-            # frozen ensemble checkpoint sets.
-            if dataset_config.get("name") != "cifar10h":
+            # Wired for CIFAR-10H (dedicated train provider) and for
+            # the DCIC family (per-seed test fold drops out, train
+            # is the union of the other 4 folds). ImageNet-ReaL is
+            # expected to use the ensemble_classifier_paths path
+            # with one of the frozen ensemble checkpoint sets.
+            dataset_name = dataset_config.get("name")
+            if dataset_name == "cifar10h":
+                provider = _make_full_network_cifar10h_train_provider(dataset_config)
+            elif dataset_config.get("family") == "dcic":
+                from experiments.epistemic_eval.datasets.dcic import (  # noqa: PLC0415
+                    build_full_train_provider,
+                )
+
+                training_block = dataset_config.get("training", {}) or {}
+                provider = build_full_train_provider(
+                    dataset_config,
+                    seed=args.seed,
+                    batch_size=int(training_block.get("batch_size", 32)),
+                    num_workers=int(training_block.get("num_workers", 0)),
+                    augment=True,
+                )
+            else:
                 msg = (
                     f"from-scratch full-network training for method "
-                    f"{method_name!r} is only wired for CIFAR-10H; got "
-                    f"dataset {dataset_config.get('name')!r}. Either "
-                    f"provide `ensemble_classifier_paths` in the dataset "
-                    f"config or extend fit_uncertainty.py with a "
-                    f"per-dataset training provider."
+                    f"{method_name!r} is not wired for dataset "
+                    f"{dataset_name!r}. Either provide "
+                    f"`ensemble_classifier_paths` in the dataset config "
+                    f"or extend fit_uncertainty.py with a per-dataset "
+                    f"training provider."
                 )
                 raise NotImplementedError(msg)
-            provider = _make_full_network_cifar10h_train_provider(dataset_config)
             factory = base_factory
         else:
             # Path 3.

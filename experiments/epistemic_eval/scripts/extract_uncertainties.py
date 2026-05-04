@@ -146,19 +146,35 @@ def _make_full_network_cifar10h_test_provider(
 def _make_test_provider(
     dataset_config: dict[str, Any],
     feature_cache_dir: Path,
+    seed: int = 0,
 ) -> FeatureProvider:
     """Build a test-time provider from the dataset config.
 
     For linear-probe mode, reads ``data/appa_real_features/test.npz``.
     For full-network CIFAR-10H, loads the canonical-format test split
     via :class:`CIFAR10NoMD5` and applies the dataset's normalisation
-    transform. ImageNet-ReaL full-network is still cluster-only;
+    transform. For DCIC datasets, picks the seed-derived test fold
+    (per :func:`experiments.epistemic_eval.datasets.dcic.test_fold_for_seed`)
+    and builds a no-augmentation DataLoader-backed provider over that
+    slice. ImageNet-ReaL full-network is still cluster-only;
     raises ``NotImplementedError`` with a clear message there.
     """
     extraction_mode = dataset_config.get("extraction_mode", "full_network")
     if extraction_mode != "linear_probe":
         if dataset_config.get("name") == "cifar10h":
             return _make_full_network_cifar10h_test_provider(dataset_config)
+        if dataset_config.get("family") == "dcic":
+            from experiments.epistemic_eval.datasets.dcic import (  # noqa: PLC0415
+                build_test_provider,
+            )
+
+            training_block = dataset_config.get("training", {}) or {}
+            return build_test_provider(
+                dataset_config,
+                seed=int(seed),
+                batch_size=int(training_block.get("batch_size", 32)),
+                num_workers=int(training_block.get("num_workers", 0)),
+            )
         msg = (
             f"Full-network test FeatureProvider for dataset "
             f"{dataset_config.get('name')!r} is not yet wired here. "
@@ -221,10 +237,24 @@ def main(argv: list[str] | None = None) -> int:
     if extraction_mode == "linear_probe":
         head_args = handle.head_factory_args or {}
         factory = _head_factory(head_args)
+    elif dataset_config.get("family") == "dcic":
+        # DCIC datasets need the same torchvision-resnet18 + K-class
+        # head that fit_uncertainty.py used at training time. The
+        # dataset_config carries num_classes; pretrained=False because
+        # the loaded handle's state_dict will overwrite the head and
+        # encoder weights anyway, and we don't want to re-download
+        # ImageNet weights at extract time.
+        from experiments.epistemic_eval.datasets.dcic import (  # noqa: PLC0415
+            make_resnet18_factory,
+        )
+
+        num_classes = int(dataset_config["classifier"]["num_classes"])
+        factory = make_resnet18_factory(num_classes=num_classes, pretrained=False)
     else:
         factory = _full_network_factory(dataset_config)
 
-    provider = _make_test_provider(dataset_config, args.feature_cache_dir)
+    seed = int(merged.get("seed", 0))
+    provider = _make_test_provider(dataset_config, args.feature_cache_dir, seed=seed)
 
     n_samples = int(method_config.get("n_samples", method_config.get("n_members", 1)))
     out = method_module.extract(

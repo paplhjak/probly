@@ -23,6 +23,7 @@ the Theorem 1 selector are loss-agnostic downstream.
 | CIFAR-10H     | cross-entropy     | Standard log-loss; matches the dominant convention in the UQ literature. |
 | ImageNet-ReaL | cross-entropy     | Same. |
 | APPA-REAL     | **squared error AND absolute error**, both reported as primary results | Loss-parametric APPA-REAL pipeline; see "APPA-REAL deployment losses" below. |
+| DCIC (9 datasets) | cross-entropy + zero-one | Classification family from Schmarje et al. 2022; see "DCIC datasets" below for the per-dataset list and locked recipe. |
 
 ## APPA-REAL deployment losses
 
@@ -158,6 +159,94 @@ learned model. (This is the whole point of "first-order datasets".)
   ImageNet models were almost certainly trained on ImageNet train.
   Confirmed via probly_audit.md §8 — wandb-fetch is the convention
   (`probly_benchmark/utils.py:153`, `load_model_from_wandb`).
+
+## DCIC datasets
+
+The DCIC benchmark (:cite:`schmarjeIsOne2022`, Zenodo
+`records/7180818`) provides 10 multi-rater image classification
+datasets with per-image vote distributions — exactly the soft-label
+shape this framework needs. We wire the **9** non-CIFAR variants
+into the pipeline (CIFAR10HDCIC is excluded because the existing
+CIFAR-10H wiring covers the same images via a different on-disk
+layout):
+
+`Benthic`, `MiceBone`, `Pig`, `Plankton`, `QualityMRI`, `Synthetic`,
+`Treeversity#1`, `Treeversity#6`, `Turkey`.
+
+### Test/train fold convention
+
+DCIC ships predefined 5-fold splits embedded in image paths (the
+second path component, e.g. `Plankton/part1/img.png`).
+
+- **Locked decision**: seed `N` runs against test fold
+  ``sorted(folds)[N % 5]``. Five seeds therefore cover all five
+  folds — full 5-fold cross-validation by construction, with no
+  expansion of the run grid (we already run 5 seeds per
+  `(method, dataset)` cell).
+- The four non-test folds are the train pool; basecls training
+  carves a 10% val split from that pool for early stopping.
+- **Divergence from Oleg's reference**: the
+  `experiments/first_order_data` pipeline picks a single test fold
+  per invocation and does not rotate. We deliberately rotate per
+  seed so the seed grid exercises every fold.
+
+### Backbone
+
+- **Locked decision**: torchvision `resnet18`, ImageNet-pretrained
+  (`ResNet18_Weights.IMAGENET1K_V1`), with the final `nn.Linear`
+  replaced by a fresh K-class head.
+- Inputs are resized to 224x224 (`Resize(224, 224) + ToTensor +
+  ImageNet-Normalize`); train-time gets `RandomHorizontalFlip`.
+- One backbone family for all 9 DCIC datasets, mirroring Oleg's
+  reference (`experiments/first_order_data/dcic_ensemble_pipeline.py`).
+  Trade-off: we forgo the smaller `probly_benchmark.resnet.ResNet18`
+  used by CIFAR-10H but keep the cross-DCIC comparison
+  recipe-uniform (and ImageNet-pretrained weights are necessary at
+  all on the small datasets like QualityMRI).
+
+### Training recipe
+
+Two recipes apply, separated by which classifier is being trained:
+
+1. **basecls** (used by mc_dropout): AdamW, lr=1e-3, weight_decay=1e-4,
+   batch_size=32, 20 epochs, early stopping with patience 4 on a 10%
+   val split. Mirrors Oleg's defaults in
+   `experiments/first_order_data/run_dcic_ensemble.py:30-47`.
+
+2. **From-scratch UQ training** (ensemble per-member, evidential,
+   ddu): the method wrappers are SGD-locked per the cross-method
+   recipe-uniformity decision (see "Methods to evaluate"). The DCIC
+   dataset config provides `training.method_overrides` with tuned
+   hyperparameters (lr=1e-3, momentum=0.9, weight_decay=1e-4, 20
+   epochs) so SGD fine-tunes from ImageNet weights without
+   destroying them. The optimizer choice differs from basecls
+   (SGD vs. AdamW) by design: cross-method comparison within DCIC
+   stays uniform (all four UQ methods use the same training recipe
+   on the same dataset).
+
+### Class label ordering
+
+`probly.datasets.torch.DCICDataset` builds `label_mappings` from a
+`set()` whose iteration order depends on `PYTHONHASHSEED`. To keep
+column ordering of `targets` stable across processes (train vs.
+extract vs. p* prep), the DCIC adapter wraps every loader instance
+with `_DeterministicDCIC` which re-keys `label_mappings` by
+`str(label)` order and rebuilds `targets` accordingly.
+
+### p\* sidecar
+
+Per-seed because the test fold rotates: the p* prep script
+(`scripts/prepare_dcic_p_star.py`) writes
+`data/<DatasetName>/p_star_seed<N>.npz`. The orchestrator passes the
+right path to `compute_oracle.py --p-star-path` per run.
+
+### Out of scope
+
+- Multi-fold averaging or cross-validation aggregation. Each
+  `(method, dataset, seed)` cell is one run with one test fold.
+- Hyperparameter tuning per dataset. The locked recipe is shared
+  across all 9 DCIC datasets; per-dataset deviations need an
+  explicit decision update here.
 
 ## Methods to evaluate
 
