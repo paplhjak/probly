@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -92,12 +93,25 @@ def _git_commit() -> str:
     return result.stdout.strip() or "unknown"
 
 
+def _predictions_fingerprint(predictions_path: Path) -> str:
+    """Return a short hex digest of ``predictions.npz``'s file bytes.
+
+    Mirrors the helper in :mod:`compute_decomposition`: hashing the
+    raw file bytes is a content-addressable cache key that catches the
+    dryrun-then-production overwrite pattern, where the run dir
+    receives a fresh ``predictions.npz`` while ``method``, ``dataset``,
+    ``loss``, ``seed`` and ``output_schema`` are unchanged.
+    """
+    return hashlib.blake2b(predictions_path.read_bytes(), digest_size=8).hexdigest()
+
+
 def _config_hash(
     method: str,
     dataset: str,
     loss: str,
     seed: int,
     output_schema: str,
+    predictions_path: Path,
 ) -> str:
     """Stable hash covering the fields that decide cache validity.
 
@@ -106,6 +120,11 @@ def _config_hash(
     ``evidential_logits_alpha`` variant) invalidates the cached
     metrics JSON instead of silently reusing stale values that were
     computed against a different cache layout.
+
+    Includes the ``predictions_fingerprint`` so a fresh
+    ``predictions.npz`` (same metadata, different contents) busts the
+    cache. Without this, an overwrite of dryrun predictions by
+    production predictions would silently keep the dryrun metrics.
     """
     payload = {
         "method": method,
@@ -113,6 +132,7 @@ def _config_hash(
         "loss": loss,
         "seed": int(seed),
         "output_schema": output_schema,
+        "predictions_fingerprint": _predictions_fingerprint(predictions_path),
         "_metrics_version": int(_METRICS_VERSION),
         "_aurec_version": int(_AUREC_VERSION),
         "_pareto_gap_version": int(_PARETO_GAP_VERSION),
@@ -349,7 +369,20 @@ def main(argv: list[str] | None = None) -> int:
     method, dataset, seed = _resolve_method_dataset_seed(run_dir)
     output_schema = _resolve_output_schema(run_dir)
     loss_str = str(args.loss)
-    cfg_hash = _config_hash(method, dataset, loss_str, seed, output_schema)
+    # Predictions must exist before we can fingerprint them; the
+    # fingerprint is part of the cache hash so the existence check
+    # has to happen before the cache-hit short-circuit (otherwise a
+    # stale sidecar from a previous run could mask a missing file).
+    predictions_path = run_dir / "predictions.npz"
+    if not predictions_path.exists():
+        msg = (
+            f"predictions.npz not found at {predictions_path}; run "
+            f"extract_uncertainties.py first."
+        )
+        raise FileNotFoundError(msg)
+    cfg_hash = _config_hash(
+        method, dataset, loss_str, seed, output_schema, predictions_path
+    )
     metrics_path = run_dir / f"metrics_{loss_str}.json"
     hash_path = run_dir / f"metrics_{loss_str}.config_hash"
 
@@ -365,13 +398,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    predictions_path = run_dir / "predictions.npz"
-    if not predictions_path.exists():
-        msg = (
-            f"predictions.npz not found at {predictions_path}; run "
-            f"extract_uncertainties.py first."
-        )
-        raise FileNotFoundError(msg)
     pred_blob = np.load(predictions_path, allow_pickle=False)
     # Dict-style load: each schema's per-method extract() writes its
     # own keys (logits / alpha+evidence / probs+density). The "indices"

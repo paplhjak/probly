@@ -88,24 +88,45 @@ def _support_fingerprint(support: np.ndarray) -> str:
     return hashlib.blake2b(arr.tobytes() + str(arr.dtype).encode(), digest_size=8).hexdigest()
 
 
+def _predictions_fingerprint(predictions_path: Path) -> str:
+    """Return a short hex digest of ``predictions.npz``'s file bytes.
+
+    Hashing the raw file bytes is sufficient and content-addressable:
+    if the predictions content changes (because, e.g., a dryrun run
+    dir was overwritten by a production run with the same dataset/
+    loss/schema metadata) the digest changes and the cache invalidates.
+    Hashing array contents instead would be equally correctness-
+    preserving but more code; we trust ``np.savez``'s deterministic
+    layout for this use.
+    """
+    return hashlib.blake2b(predictions_path.read_bytes(), digest_size=8).hexdigest()
+
+
 def _per_loss_hash(
     dataset_name: str,
     loss: str,
     support: np.ndarray,
     output_schema: str,
+    predictions_path: Path,
 ) -> str:
-    """Stable hash of (dataset, loss, support, schema, version).
+    """Stable hash of (dataset, loss, support, schema, predictions, version).
 
     The ``output_schema`` is included so a schema change (e.g. switching a
     method from sampling-based to evidential) invalidates the cache. Without
     it, a re-run with a different schema could silently leave a stale
     ``decomposition_<loss>.npz`` in place.
+
+    The ``predictions_fingerprint`` is included so re-running on a
+    fresh ``predictions.npz`` (same dataset/schema metadata, different
+    contents - the dryrun-then-production overwrite pattern) busts
+    the cache instead of silently keeping a stale decomposition.
     """
     payload = {
         "dataset": dataset_name,
         "loss": loss,
         "support_fingerprint": _support_fingerprint(support),
         "output_schema": output_schema,
+        "predictions_fingerprint": _predictions_fingerprint(predictions_path),
         "decomposition_version": int(_DECOMPOSITION_VERSION),
     }
     return hash_config(payload)
@@ -280,7 +301,13 @@ def main(argv: list[str] | None = None) -> int:
 
     per_loss_hashes: dict[str, str] = {}
     for loss in supported_losses:
-        loss_hash = _per_loss_hash(dataset_name, str(loss), support, output_schema)
+        loss_hash = _per_loss_hash(
+            dataset_name,
+            str(loss),
+            support,
+            output_schema,
+            predictions_path,
+        )
         per_loss_hashes[loss] = loss_hash
         cache_file = run_dir / f"decomposition_{loss}.npz"
         sidecar = run_dir / f"decomposition_{loss}.config_hash"
