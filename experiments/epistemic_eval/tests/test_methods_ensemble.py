@@ -117,6 +117,135 @@ def test_ensemble_pretrained_path_raises_when_too_few_paths(tmp_path) -> None:
         )
 
 
+def test_make_member_subset_provider_drops_distinct_folds() -> None:
+    """Members 0..N-1 each drop a different deterministic fold.
+
+    Pin: per-member train rotation produces ``n_members`` subset
+    providers whose held-out indices form a partition of the input
+    rows, and each subset has size ~``(n_members - 1) / n_members``.
+    """
+    n_members = 5
+    n_samples = 50  # divisible by n_members for a clean partition
+    g = torch.Generator().manual_seed(0)
+    features = torch.randn(n_samples, _NUM_FEATURES, generator=g)
+    labels = torch.zeros(n_samples, _NUM_CLASSES)
+    labels[:, 0] = 1.0
+    batches = [(features[i : i + 8], labels[i : i + 8]) for i in range(0, n_samples, 8)]
+    provider = FeatureProvider(
+        batches=batches,
+        mode="linear_probe",
+        feature_dim=_NUM_FEATURES,
+        n_classes=_NUM_CLASSES,
+        indices=np.arange(n_samples, dtype=np.int64),
+    )
+    held_out_per_member: list[set[int]] = []
+    kept_per_member: list[set[int]] = []
+    for m in range(n_members):
+        sub = ens_module._make_member_subset_provider(provider, m, n_members)
+        kept = set(int(i) for i in sub.indices.tolist())
+        kept_per_member.append(kept)
+        held_out_per_member.append(set(range(n_samples)) - kept)
+        # Each member trains on (n_members - 1)/n_members of the data
+        # (exact for divisible cases).
+        assert len(kept) == n_samples * (n_members - 1) // n_members, (m, len(kept))
+    # Held-out folds partition the input rows.
+    union = set().union(*held_out_per_member)
+    assert union == set(range(n_samples))
+    # No two members hold out the same fold.
+    for i in range(n_members):
+        for j in range(i + 1, n_members):
+            assert held_out_per_member[i].isdisjoint(held_out_per_member[j]), (i, j)
+
+
+def test_make_member_subset_provider_is_deterministic() -> None:
+    """Two calls with the same args return the same kept indices."""
+    provider = _make_provider(seed=0)
+    sub_a = ens_module._make_member_subset_provider(provider, member_idx=2, n_members=5)
+    sub_b = ens_module._make_member_subset_provider(provider, member_idx=2, n_members=5)
+    np.testing.assert_array_equal(sub_a.indices, sub_b.indices)
+
+
+def test_ensemble_fit_uses_rotation_when_flag_set() -> None:
+    """``per_member_train_rotation: true`` makes members see different subsets.
+
+    Pin: with rotation off, every member's recorded provider has the
+    full N samples; with rotation on, members get distinct
+    ``(n_members - 1)/n_members`` subsets that partition the input
+    on the held-out folds.
+    """
+    provider = _make_provider(seed=0)
+    seen_indices: list[np.ndarray] = []
+
+    real_train = ens_module._train_member
+
+    def recording_train_member(model, data_provider, method_config, seed, **kwargs):
+        seen_indices.append(np.asarray(data_provider.indices))
+        return real_train(model, data_provider, method_config, seed, **kwargs)
+
+    method_config = {
+        "name": "ensemble",
+        "method_module": "experiments.epistemic_eval.methods.ensemble",
+        "n_members": 5,
+        "epochs": 1,
+        "lr": 1.0e-2,
+        "per_member_train_rotation": True,
+    }
+    dataset_config = {"name": "synthetic", "extraction_mode": "linear_probe"}
+
+    import unittest.mock
+    with unittest.mock.patch.object(ens_module, "_train_member", recording_train_member):
+        ens_module.fit(
+            method_config=method_config,
+            dataset_config=dataset_config,
+            data_provider=provider,
+            model_factory=_factory,
+            seed=0,
+        )
+    assert len(seen_indices) == 5
+    # Each member saw a strict subset (rotation removes one fold).
+    for arr in seen_indices:
+        assert arr.shape[0] < _NUM_SAMPLES
+    # Held-out indices across members partition the input.
+    held_out = [set(range(_NUM_SAMPLES)) - set(arr.tolist()) for arr in seen_indices]
+    union = set().union(*held_out)
+    assert union == set(range(_NUM_SAMPLES))
+
+
+def test_ensemble_fit_default_no_rotation() -> None:
+    """Default behaviour (no rotation flag): every member sees the full provider.
+
+    Pin back-compat with the CIFAR-10H/DCIC paths that don't opt in.
+    """
+    provider = _make_provider(seed=0)
+    seen_lengths: list[int] = []
+
+    real_train = ens_module._train_member
+
+    def recording_train_member(model, data_provider, method_config, seed, **kwargs):
+        seen_lengths.append(int(data_provider.indices.shape[0]))
+        return real_train(model, data_provider, method_config, seed, **kwargs)
+
+    method_config = {
+        "name": "ensemble",
+        "method_module": "experiments.epistemic_eval.methods.ensemble",
+        "n_members": 3,
+        "epochs": 1,
+        "lr": 1.0e-2,
+    }
+    dataset_config = {"name": "synthetic", "extraction_mode": "linear_probe"}
+
+    import unittest.mock
+    with unittest.mock.patch.object(ens_module, "_train_member", recording_train_member):
+        ens_module.fit(
+            method_config=method_config,
+            dataset_config=dataset_config,
+            data_provider=provider,
+            model_factory=_factory,
+            seed=0,
+        )
+    assert seen_lengths == [_NUM_SAMPLES] * 3
+
+
 def test_ensemble_save_load_roundtrip(tmp_path) -> None:
     """save + load reconstructs the handle."""
     provider = _make_provider(seed=0)

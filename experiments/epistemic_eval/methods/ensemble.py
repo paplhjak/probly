@@ -78,6 +78,86 @@ def _required(config: dict[str, Any], key: str) -> Any:  # noqa: ANN401
     return config[key]
 
 
+#: Fixed RNG seed used to partition the train pool into per-member folds.
+#: Independent of the run seed so seeds 0..4 of an experiment grid all
+#: see the same fold structure (and only differ in member init); this
+#: separates "fold-rotation diversity" from "init diversity" cleanly.
+_FOLD_PARTITION_SEED: int = 0
+
+
+def _make_member_subset_provider(
+    provider: FeatureProvider,
+    member_idx: int,
+    n_members: int,
+) -> FeatureProvider:
+    """Return a FeatureProvider whose batches drop the member_idx-th fold.
+
+    Concatenates the provider's existing batches into one ``(X, Y)``
+    pair, partitions the rows into ``n_members`` deterministic folds via
+    a fixed-seed permutation (see :data:`_FOLD_PARTITION_SEED`), and
+    rebuilds batches over the ``n_members - 1`` folds that don't include
+    ``member_idx``.
+
+    Each member therefore trains on ``(n_members - 1) / n_members`` of
+    the train pool with a different fold dropped per member; pairs of
+    members share ``(n_members - 2) / n_members`` of their training
+    rows. Used by the linear-probe APPA-REAL ensemble path to inject
+    data-side diversity in addition to init-side diversity (per
+    :doc:`decisions.md` ``-> "APPA-REAL ensemble train rotation"``).
+
+    The test set is never touched -- ``data_provider`` here is the
+    train provider; the test-time provider is built separately by
+    :mod:`extract_uncertainties` and is identical for every member.
+
+    Args:
+        provider: Train-time :class:`FeatureProvider`.
+        member_idx: 0-based ensemble member index.
+        n_members: Total ensemble size.
+
+    Returns:
+        A new :class:`FeatureProvider` whose ``batches`` cover the
+        non-dropped folds. ``mode``, ``feature_dim``, ``n_classes`` are
+        carried through. ``indices`` is the corresponding subset.
+    """
+    if not provider.batches:
+        return provider
+    if n_members <= 1:
+        return provider
+    all_x = torch.cat([b[0] for b in provider.batches], dim=0)
+    all_y = torch.cat([b[1] for b in provider.batches], dim=0)
+    n_total = int(all_x.shape[0])
+    rng = np.random.default_rng(_FOLD_PARTITION_SEED)
+    perm = rng.permutation(n_total)
+    fold_size = max(n_total // n_members, 1)
+    fold_of = np.zeros(n_total, dtype=np.int64)
+    for pos, idx in enumerate(perm):
+        # Cap the last fold at n_members - 1 so the residue lands there
+        # rather than overflowing past n_members - 1.
+        fold_of[int(idx)] = min(pos // fold_size, n_members - 1)
+    keep = np.flatnonzero(fold_of != int(member_idx))
+    subset_x = all_x[keep]
+    subset_y = all_y[keep]
+    if provider.batches:
+        batch_size = int(provider.batches[0][0].shape[0])
+    else:
+        batch_size = 128
+    new_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for start in range(0, len(keep), batch_size):
+        stop = min(start + batch_size, len(keep))
+        new_batches.append((subset_x[start:stop], subset_y[start:stop]))
+    if int(provider.indices.shape[0]) == n_total:
+        new_indices = provider.indices[keep]
+    else:
+        new_indices = np.arange(len(keep), dtype=np.int64)
+    return FeatureProvider(
+        batches=new_batches,
+        mode=provider.mode,
+        feature_dim=provider.feature_dim,
+        n_classes=provider.n_classes,
+        indices=new_indices,
+    )
+
+
 def _train_member(
     model: nn.Module,
     data_provider: FeatureProvider,
@@ -114,17 +194,39 @@ def _train_member(
     weight_decay = float(method_config.get("weight_decay", 0.0))
     momentum = float(method_config.get("momentum", 0.9))
     nesterov = bool(method_config.get("nesterov", False))
+    optimizer_name = str(method_config.get("optimizer", "sgd")).lower()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.SGD(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=lr,
-        momentum=momentum,
-        weight_decay=weight_decay,
-        nesterov=nesterov,
-    )
+    # Optimizer dispatch: SGD by default (cross-method recipe-uniformity
+    # decision in decisions.md "Methods to evaluate"). For datasets like
+    # APPA-REAL where the wrapper trains a tiny MLP head over cached
+    # backbone features, SGD lr=1e-3 cosine decays to ~0 lr before the
+    # head converges. The dataset config can opt into AdamW via
+    # ``training.method_overrides.optimizer: adamw``; AdamW's adaptive
+    # per-parameter lr is the right tool for the linear-probe regime.
+    optimizer: torch.optim.Optimizer
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+    else:
+        msg = (
+            f"unknown optimizer {optimizer_name!r} for ensemble; "
+            f"expected 'sgd' (default) or 'adamw'."
+        )
+        raise ValueError(msg)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(epochs, 1)
     )
@@ -214,12 +316,28 @@ def fit(
                 sd = blob
             state_dicts.append({k: v.detach().cpu() for k, v in sd.items()})
     else:
+        # Per-member train rotation (off by default for back-compat
+        # with CIFAR-10H/DCIC; opted in by the APPA-REAL dataset config
+        # via ``training.method_overrides.per_member_train_rotation: true``).
+        # When on, each member sees a different (n_members-1)/n_members
+        # subset of the train pool; this gives ensembles a data-side
+        # source of diversity beyond random init, which is necessary
+        # in regimes where heads otherwise converge to a shared basin
+        # (frozen-features APPA-REAL).
+        per_member_rotation = bool(
+            method_config.get("per_member_train_rotation", False)
+        )
         for member_idx, member_seed in enumerate(member_seeds):
             setup_determinism(member_seed)
             model = model_factory()
+            member_provider = (
+                _make_member_subset_provider(data_provider, member_idx, n_members)
+                if per_member_rotation
+                else data_provider
+            )
             trained = _train_member(
                 model,
-                data_provider,
+                member_provider,
                 method_config,
                 member_seed,
                 member_idx=member_idx,

@@ -147,8 +147,138 @@ def test_evidential_rejects_non_positive_alpha() -> None:
 
 
 def test_evidential_rejects_unsupported_loss() -> None:
-    with pytest.raises(ValueError, match=r"cross_entropy.*zero_one"):
-        evidential_decomposition(_ALPHA, _EVIDENCE, "squared")  # type: ignore[arg-type]
+    with pytest.raises(
+        ValueError, match=r"cross_entropy.*zero_one.*squared.*absolute"
+    ):
+        evidential_decomposition(_ALPHA, _EVIDENCE, "lbfgs")  # type: ignore[arg-type]
+
+
+def test_evidential_squared_requires_support() -> None:
+    with pytest.raises(ValueError, match="`support` is required"):
+        evidential_decomposition(_ALPHA, _EVIDENCE, "squared")
+
+
+def test_evidential_squared_closed_form() -> None:
+    """Hand-checked squared decomposition on the K=3 fixture.
+
+    For row i=0 (alpha=[10, 1, 1], support=[0, 1, 2]):
+      mu = [10/12, 1/12, 1/12]
+      H_hat = 0*10/12 + 1*1/12 + 2*1/12 = 3/12 = 0.25
+      Var_p[y] = 0 + 1*(1/12) + 4*(1/12) - 0.0625 = 5/12 - 1/16 = 0.41666... - 0.0625 = 0.354166...
+      alpha_0 = 12; A_hat = Var_p * 12/13 ; E_hat = Var_p / 13.
+      A_hat + E_hat = Var_p exactly (additivity).
+    """
+    support = np.array([0.0, 1.0, 2.0], dtype=np.float64)
+    out = evidential_decomposition(
+        _ALPHA, _EVIDENCE, "squared", support=support
+    )
+    assert out["A_hat"].dtype == np.float32
+    assert out["E_hat"].dtype == np.float32
+    assert out["H_hat"].dtype == np.float32
+    assert out["A_hat"].shape == (5,)
+    assert out["E_hat"].shape == (5,)
+    assert out["H_hat"].shape == (5,)
+    # Row 0:
+    np.testing.assert_allclose(out["H_hat"][0], 3.0 / 12.0, atol=1e-6)
+    var_p_0 = (1.0 / 12.0) * 1 + (1.0 / 12.0) * 4 - (3.0 / 12.0) ** 2
+    np.testing.assert_allclose(
+        out["A_hat"][0], var_p_0 * 12.0 / 13.0, atol=1e-6
+    )
+    np.testing.assert_allclose(out["E_hat"][0], var_p_0 / 13.0, atol=1e-6)
+    # Row 1 (uniform alpha=[1,1,1]): mu=[1/3,1/3,1/3]; H_hat=1.0;
+    # Var_p[y] = 1*(1/3) + 4*(1/3) - 1 = 5/3 - 1 = 2/3.
+    np.testing.assert_allclose(out["H_hat"][1], 1.0, atol=1e-6)
+    var_p_1 = 2.0 / 3.0
+    np.testing.assert_allclose(
+        out["A_hat"][1], var_p_1 * 3.0 / 4.0, atol=1e-6
+    )
+    np.testing.assert_allclose(out["E_hat"][1], var_p_1 / 4.0, atol=1e-6)
+    # Additivity (T* = A* + E*) per row.
+    var_p_all = np.array(
+        [
+            var_p_0,
+            2.0 / 3.0,
+            2.0 / 3.0,
+            (1.0 * 0.49 + 4.0 * 0.01) - (0.49 + 0.02) ** 2,
+            2.0 / 3.0,
+        ]
+    )
+    np.testing.assert_allclose(
+        out["A_hat"] + out["E_hat"], var_p_all.astype(np.float32), atol=5e-6
+    )
+
+
+def test_evidential_absolute_basic_contract() -> None:
+    """Sample-based absolute decomp returns the right shapes + dtypes.
+
+    The closed-form check is harder for absolute (median is non-smooth)
+    so we just pin shape + dtype + nonnegativity + h_hat-in-support.
+    Determinism is verified separately.
+
+    H_hat is the BMA-median VALUE in support units (float32), matching
+    the ``logits_nks`` regression decomposition's contract -- not the
+    index, despite the index being what we compute internally.
+    """
+    support = np.array([0.0, 1.0, 2.0], dtype=np.float64)
+    out = evidential_decomposition(
+        _ALPHA, _EVIDENCE, "absolute", support=support
+    )
+    assert out["A_hat"].dtype == np.float32
+    assert out["E_hat"].dtype == np.float32
+    assert out["H_hat"].dtype == np.float32
+    assert out["A_hat"].shape == (5,)
+    assert out["E_hat"].shape == (5,)
+    assert out["H_hat"].shape == (5,)
+    assert (out["A_hat"] >= 0.0).all()
+    assert (out["E_hat"] >= 0.0).all()
+    # H_hat is the median VALUE; for a 3-point support it must be in {0, 1, 2}.
+    assert np.isin(out["H_hat"], support.astype(np.float32)).all()
+
+
+def test_evidential_absolute_is_deterministic() -> None:
+    """Two consecutive calls produce bit-identical outputs.
+
+    Pin: the Dirichlet sampler uses ``_ABSOLUTE_SAMPLE_SEED`` (fixed),
+    so the cache hash is a pure function of inputs.
+    """
+    support = np.array([0.0, 1.0, 2.0], dtype=np.float64)
+    a = evidential_decomposition(_ALPHA, _EVIDENCE, "absolute", support=support)
+    b = evidential_decomposition(_ALPHA, _EVIDENCE, "absolute", support=support)
+    np.testing.assert_array_equal(a["A_hat"], b["A_hat"])
+    np.testing.assert_array_equal(a["E_hat"], b["E_hat"])
+    np.testing.assert_array_equal(a["H_hat"], b["H_hat"])
+
+
+def test_dispatcher_routes_evidential_alpha_squared() -> None:
+    support = np.arange(3, dtype=np.float64)
+    out_direct = evidential_decomposition(
+        _ALPHA, _EVIDENCE, "squared", support=support
+    )
+    out_dispatch = decompose_from_schema(
+        {"alpha": _ALPHA, "evidence": _EVIDENCE},
+        "squared",
+        support,
+        schema="evidential_alpha",
+    )
+    np.testing.assert_array_equal(out_dispatch["A_hat"], out_direct["A_hat"])
+    np.testing.assert_array_equal(out_dispatch["E_hat"], out_direct["E_hat"])
+    np.testing.assert_array_equal(out_dispatch["H_hat"], out_direct["H_hat"])
+
+
+def test_dispatcher_routes_evidential_alpha_absolute() -> None:
+    support = np.arange(3, dtype=np.float64)
+    out_direct = evidential_decomposition(
+        _ALPHA, _EVIDENCE, "absolute", support=support
+    )
+    out_dispatch = decompose_from_schema(
+        {"alpha": _ALPHA, "evidence": _EVIDENCE},
+        "absolute",
+        support,
+        schema="evidential_alpha",
+    )
+    np.testing.assert_array_equal(out_dispatch["A_hat"], out_direct["A_hat"])
+    np.testing.assert_array_equal(out_dispatch["E_hat"], out_direct["E_hat"])
+    np.testing.assert_array_equal(out_dispatch["H_hat"], out_direct["H_hat"])
 
 
 def test_evidential_rejects_wrong_alpha_ndim() -> None:

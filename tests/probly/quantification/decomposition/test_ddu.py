@@ -141,8 +141,54 @@ def test_ddu_rejects_negative_probs() -> None:
 
 
 def test_ddu_rejects_unsupported_loss() -> None:
-    with pytest.raises(ValueError, match=r"cross_entropy.*zero_one"):
-        ddu_decomposition(_PROBS, _DENSITY, "squared")  # type: ignore[arg-type]
+    """Unknown loss strings raise (not just unsupported deployment losses)."""
+    with pytest.raises(
+        ValueError, match=r"cross_entropy.*zero_one.*squared.*absolute"
+    ):
+        ddu_decomposition(_PROBS, _DENSITY, "lbfgs")  # type: ignore[arg-type]
+
+
+def test_ddu_squared_requires_support() -> None:
+    with pytest.raises(ValueError, match="`support` is required"):
+        ddu_decomposition(_PROBS, _DENSITY, "squared")
+
+
+def test_ddu_squared_decomposition_basic_contract() -> None:
+    """Squared returns (mean, variance, density) per row.
+
+    H_hat[i] = sum_k support[k] * probs[i, k]
+    A_hat[i] = Var_p[y]
+    E_hat[i] = -density[i]  (unchanged from classification branches)
+    """
+    support = np.array([0.0, 10.0, 20.0], dtype=np.float64)  # K=3 fixture
+    out = ddu_decomposition(_PROBS, _DENSITY, "squared", support=support)
+    assert out["A_hat"].dtype == np.float32
+    assert out["E_hat"].dtype == np.float32
+    assert out["H_hat"].dtype == np.float32
+    n = _PROBS.shape[0]
+    assert out["A_hat"].shape == (n,)
+    # H_hat is the mean predictor; bounded by min/max of support.
+    assert (out["H_hat"] >= support[0] - 1e-6).all()
+    assert (out["H_hat"] <= support[-1] + 1e-6).all()
+    # E_hat unchanged from cross_entropy / zero_one branches.
+    np.testing.assert_allclose(out["E_hat"], -_DENSITY.astype(np.float32))
+
+
+def test_ddu_absolute_decomposition_basic_contract() -> None:
+    """Absolute returns (median value in support, MAD around median, density).
+
+    H_hat is the median VALUE in support units (float32) — matching the
+    ``logits_nks`` regression contract — not the index.
+    """
+    support = np.array([0.0, 10.0, 20.0], dtype=np.float64)
+    out = ddu_decomposition(_PROBS, _DENSITY, "absolute", support=support)
+    assert out["A_hat"].dtype == np.float32
+    assert out["E_hat"].dtype == np.float32
+    assert out["H_hat"].dtype == np.float32
+    # H_hat is the median VALUE; for a 3-point support {0,10,20} it must
+    # be one of those.
+    assert np.isin(out["H_hat"], support.astype(np.float32)).all()
+    np.testing.assert_allclose(out["E_hat"], -_DENSITY.astype(np.float32))
 
 
 def test_ddu_rejects_density_length_mismatch() -> None:

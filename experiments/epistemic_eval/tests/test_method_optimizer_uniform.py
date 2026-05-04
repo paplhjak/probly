@@ -224,6 +224,91 @@ def test_evidential_uses_sgd_cosine(monkeypatch: pytest.MonkeyPatch) -> None:
     assert cosine_spy.calls[0]["kwargs"]["T_max"] == 2
 
 
+def test_ensemble_can_opt_into_adamw(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``optimizer: adamw`` in method_config flips ensemble's per-member trainer.
+
+    The cross-method recipe-uniformity decision pins SGD as the default
+    so cross-method comparisons on the same dataset stay clean. Datasets
+    in a different regime (APPA-REAL's linear-probe MlpHead-on-cached-
+    features) opt in via ``training.method_overrides.optimizer: adamw``;
+    the dispatch is per-call, no wrapper change downstream.
+    """
+    sgd_spy, adamw_spy, cosine_spy = _install_spies(monkeypatch)
+
+    method_config: dict[str, Any] = {
+        "name": "ensemble",
+        "method_module": "experiments.epistemic_eval.methods.ensemble",
+        "n_members": 2,
+        "epochs": 2,
+        "optimizer": "adamw",
+        "lr": 1.0e-3,
+        "weight_decay": 1.0e-4,
+    }
+    dataset_config = {
+        "name": "synthetic",
+        "extraction_mode": "linear_probe",
+    }
+    ens_module.fit(
+        method_config=method_config,
+        dataset_config=dataset_config,
+        data_provider=_make_provider(),
+        model_factory=lambda: nn.Linear(_NUM_FEATURES, _NUM_CLASSES),
+        seed=0,
+    )
+    assert sgd_spy.calls == [], sgd_spy.calls
+    assert len(adamw_spy.calls) == 2  # one per ensemble member
+    for call in adamw_spy.calls:
+        kwargs = call["kwargs"]
+        assert kwargs["lr"] == pytest.approx(1.0e-3), kwargs
+        assert kwargs["weight_decay"] == pytest.approx(1.0e-4), kwargs
+    # The cosine schedule still wraps the AdamW optimizer.
+    assert len(cosine_spy.calls) == 2
+
+
+def test_evidential_can_opt_into_adamw(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same dispatch as ensemble: ``optimizer: adamw`` swaps SGD for AdamW."""
+    sgd_spy, adamw_spy, cosine_spy = _install_spies(monkeypatch)
+
+    model: nn.Module = _LinearWithSoftplusAlpha()
+    method_config: dict[str, Any] = {
+        "epochs": 2,
+        "optimizer": "adamw",
+        "lr": 1.0e-3,
+        "weight_decay": 1.0e-4,
+    }
+    ev_module._train_evidential_model(
+        model, _make_provider(), method_config, seed=0
+    )
+    assert sgd_spy.calls == [], sgd_spy.calls
+    assert len(adamw_spy.calls) == 1
+    assert adamw_spy.calls[0]["kwargs"]["lr"] == pytest.approx(1.0e-3)
+    assert len(cosine_spy.calls) == 1
+
+
+def test_ensemble_rejects_unknown_optimizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``optimizer: <anything-else>`` raises rather than silently defaulting."""
+    _install_spies(monkeypatch)
+    method_config: dict[str, Any] = {
+        "name": "ensemble",
+        "method_module": "experiments.epistemic_eval.methods.ensemble",
+        "n_members": 1,
+        "epochs": 2,
+        "optimizer": "lbfgs",
+        "lr": 1.0e-3,
+    }
+    dataset_config = {"name": "synthetic", "extraction_mode": "linear_probe"}
+    with pytest.raises(ValueError, match="unknown optimizer"):
+        ens_module.fit(
+            method_config=method_config,
+            dataset_config=dataset_config,
+            data_provider=_make_provider(),
+            model_factory=lambda: nn.Linear(_NUM_FEATURES, _NUM_CLASSES),
+            seed=0,
+        )
+
+
 def test_ddu_uses_sgd_cosine(monkeypatch: pytest.MonkeyPatch) -> None:
     """DDU's Phase A trainer must construct SGD + CosineAnnealingLR, not AdamW."""
     sgd_spy, adamw_spy, cosine_spy = _install_spies(monkeypatch)

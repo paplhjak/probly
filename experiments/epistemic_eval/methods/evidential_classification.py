@@ -150,17 +150,37 @@ def _train_evidential_model(
     weight_decay = float(method_config.get("weight_decay", 0.0))
     momentum = float(method_config.get("momentum", 0.9))
     nesterov = bool(method_config.get("nesterov", False))
+    optimizer_name = str(method_config.get("optimizer", "sgd")).lower()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
 
-    optimizer = torch.optim.SGD(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=lr,
-        momentum=momentum,
-        weight_decay=weight_decay,
-        nesterov=nesterov,
-    )
+    # Optimizer dispatch: SGD by default (cross-method recipe-uniformity
+    # decision); ``training.method_overrides.optimizer: adamw`` opts into
+    # AdamW for the linear-probe regime where SGD-cosine underfits a
+    # small head over cached features. See ensemble._train_member for
+    # the same dispatch.
+    optimizer: torch.optim.Optimizer
+    if optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+        )
+    elif optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+    else:
+        msg = (
+            f"unknown optimizer {optimizer_name!r} for evidential; "
+            f"expected 'sgd' (default) or 'adamw'."
+        )
+        raise ValueError(msg)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(epochs, 1)
     )

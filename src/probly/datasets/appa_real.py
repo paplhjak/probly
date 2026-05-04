@@ -207,6 +207,8 @@ class AppaReal(torch.utils.data.Dataset):
         split: Literal["train", "valid", "test"] = "test",
         transform: Callable[..., torch.Tensor] | None = None,
         age_support: Sequence[int] | None = None,
+        *,
+        use_face_crops: bool = False,
     ) -> None:
         """Initialise the dataset for the chosen split.
 
@@ -223,6 +225,13 @@ class AppaReal(torch.utils.data.Dataset):
                 split. The paper's main results use
                 :meth:`compute_global_support` so that ``A*`` / ``E*``
                 oracle computations are comparable across splits.
+            use_face_crops: If ``True``, append ``"_face.jpg"`` to each
+                ``file_name`` from the CSV before resolving the image on
+                disk. The CVPR 2017 release ships, for every original
+                ``X.jpg``, a face crop (40% margin, Mathias detector) at
+                ``X.jpg_face.jpg`` -- this is what published
+                age-estimation baselines train on. Defaults to ``False``
+                (preserves the upstream lookup behaviour).
 
         Raises:
             ValueError: If ``root`` does not exist, the per-rater CSV
@@ -232,6 +241,7 @@ class AppaReal(torch.utils.data.Dataset):
         """
         self._root = pathlib.Path(root).expanduser()
         self._split = split
+        self._use_face_crops = bool(use_face_crops)
         self.transform = transform if transform is not None else _DEFAULT_TRANSFORM
 
         csv_path, image_dir = self._validate_paths(self._root, split)
@@ -250,11 +260,13 @@ class AppaReal(torch.utils.data.Dataset):
         # images and keeps the construction code straightforward.
         age_to_idx = {age: idx for idx, age in enumerate(self.age_support)}
         per_image_counts: dict[str, torch.Tensor] = {}
+        suffix = "_face.jpg" if self._use_face_crops else ""
         for filename, age in zip(df[file_col].tolist(), ages_int.tolist(), strict=True):
-            counts = per_image_counts.get(filename)
+            keyed_name = f"{filename}{suffix}"
+            counts = per_image_counts.get(keyed_name)
             if counts is None:
                 counts = torch.zeros(len(self.age_support), dtype=torch.float32)
-                per_image_counts[filename] = counts
+                per_image_counts[keyed_name] = counts
             counts[age_to_idx[age]] += 1.0
 
         self.image_filenames = list(per_image_counts.keys())

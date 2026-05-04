@@ -52,7 +52,7 @@ from .regression import absolute_decomposition, squared_decomposition
 from .zero_one import SecondOrderZeroOneDecomposition
 
 #: Bumped on math changes to invalidate caches.
-_DECOMPOSITION_VERSION = 1
+_DECOMPOSITION_VERSION = 2
 
 LossName = Literal["cross_entropy", "zero_one", "squared", "absolute"]
 
@@ -195,14 +195,16 @@ def decompose_from_schema(
                 f"`predictions`; missing {sorted(missing)} (got {sorted(predictions)})."
             )
             raise ValueError(msg)
-        # The evidential decomposition only accepts cross_entropy / zero_one.
-        # The runtime check inside `evidential_decomposition` raises ValueError
-        # on squared / absolute; we silence ty's stricter Literal narrowing so
-        # callers don't need to pre-validate.
+        # The evidential decomposition supports all four losses since
+        # _DECOMPOSITION_VERSION=2. cross_entropy / zero_one ignore
+        # ``support``; squared / absolute require it (the regression
+        # branches need to know what scalar value each Dirichlet column
+        # corresponds to).
         return evidential_decomposition(
             predictions["alpha"],
             predictions["evidence"],
             loss,  # ty: ignore[invalid-argument-type]
+            support=support,
         )
     if schema == "ddu_probs_density":
         missing = {"probs", "density"} - set(predictions)
@@ -212,11 +214,14 @@ def decompose_from_schema(
                 f"`predictions`; missing {sorted(missing)} (got {sorted(predictions)})."
             )
             raise ValueError(msg)
-        # Same Literal-narrowing comment as above.
+        # DDU supports all four losses since _DECOMPOSITION_VERSION=2.
+        # Same support-required-for-regression contract as the
+        # evidential decomposition.
         return ddu_decomposition(
             predictions["probs"],
             predictions["density"],
             loss,  # ty: ignore[invalid-argument-type]
+            support=support,
         )
     msg = f"unknown output_schema: {schema!r}; expected one of {OutputSchema.__args__!r}."  # type: ignore[attr-defined]
     raise ValueError(msg)

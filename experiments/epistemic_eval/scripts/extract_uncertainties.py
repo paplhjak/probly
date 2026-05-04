@@ -192,7 +192,14 @@ def _make_test_provider(
     n = features.shape[0]
     feature_dim = int(features.shape[1])
     num_classes = int(dataset_config.get("metadata", {}).get("num_classes", 0))
-    labels = np.full((n, max(num_classes, 1)), 1.0 / max(num_classes, 1), dtype=np.float32)
+    if "targets" in blob.files:
+        labels = np.asarray(blob["targets"], dtype=np.float32)
+        if num_classes <= 0:
+            num_classes = int(labels.shape[1])
+    else:
+        labels = np.full(
+            (n, max(num_classes, 1)), 1.0 / max(num_classes, 1), dtype=np.float32
+        )
     indices = np.arange(n, dtype=np.int64)
     batches = []
     batch_size = 128

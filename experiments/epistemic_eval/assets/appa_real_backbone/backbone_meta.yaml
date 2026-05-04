@@ -1,0 +1,42 @@
+# APPA-REAL backbone metadata.
+#
+# Records the artifact identity for ``weights.pth`` so the pipeline can
+# verify it is loading the expected backbone before extracting features.
+# See decisions.md -> "APPA-REAL backbone strategy" and the README in
+# this directory.
+
+architecture: torchvision.models.resnet101
+weights_file: weights.pth
+weights_sha256: e60e18fc2a35cd2ce01c9d99c1ec3e9e82c9cfc4e86b1869a12e7dcf44f4c2a6
+
+# Training corpus tag from the original filename
+# (resnet101_CSFD16_weights.pth). The "CSFD16" tag is the
+# user-supplied face-task pretraining corpus identifier; full
+# provenance is the user's notes, not committed here.
+pretraining_corpus: CSFD16
+pretraining_corpus_size: unknown
+
+# State-dict shape: 624 keys, ending at ``layer4.2.bn3.*``. The final
+# fully-connected (1000-class ImageNet) head was stripped before the
+# checkpoint was saved, so loading requires either replacing
+# ``model.fc`` with ``nn.Identity()`` before ``load_state_dict`` or
+# passing ``strict=False``. ``extract_features.py`` does the former.
+feature_layer: layer4
+feature_dim: 2048
+
+# Standard torchvision ResNet input contract; the head-stripped
+# encoder still expects this preprocessing because the backbone was
+# trained on it.
+expected_input:
+  image_size: [224, 224]
+  channels: 3
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+  interpolation: bilinear
+
+notes: |
+  Head-stripped torchvision ResNet-101 pretrained on a face / age
+  corpus identified as CSFD16 in the user-supplied artifact name.
+  The pipeline never trains the encoder; we use it as a frozen
+  feature extractor (linear-probe paradigm) per
+  ``decisions.md`` -> "APPA-REAL backbone strategy".

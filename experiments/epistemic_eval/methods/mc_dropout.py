@@ -95,6 +95,13 @@ def _train_mc_dropout_model(
     (the test suite passes a small flat method config with ``epochs``
     and ``lr``). Reads ``method_config`` for ``epochs``, ``lr``, and
     optionally ``weight_decay``.
+
+    Per-epoch progress is printed to stdout in the format
+    ``epoch <e>/<E>: train_loss=<float>`` matching the convention the
+    other UQ wrappers use, so SLURM logs surface progress for
+    multi-epoch runs (APPA-REAL linear-probe, 50 epochs). The print
+    is a no-op when ``epochs == 0`` (the full-network load-pretrained
+    short-circuit used by CIFAR-10H/DCIC mc_dropout).
     """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
@@ -107,7 +114,9 @@ def _train_mc_dropout_model(
         weight_decay=weight_decay,
     )
     model.train()
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
         for x, y in data_provider:
             logits = model(x)
             # KL-equivalent cross-entropy on soft targets; matches
@@ -119,6 +128,13 @@ def _train_mc_dropout_model(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            epoch_loss += float(loss.detach().item())
+            n_batches += 1
+        train_loss = epoch_loss / max(n_batches, 1)
+        print(
+            f"epoch {epoch + 1}/{epochs}: train_loss={train_loss:.4f}",
+            flush=True,
+        )
     return model
 
 

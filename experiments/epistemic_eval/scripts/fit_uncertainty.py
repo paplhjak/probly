@@ -322,7 +322,15 @@ def _make_linear_probe_provider(
     split: str,
     batch_size: int = 128,
 ) -> FeatureProvider:
-    """Build a feature-mode provider from cached ``.npz`` features."""
+    """Build a feature-mode provider from cached ``.npz`` features.
+
+    When the cache file carries a ``targets`` array (the contract
+    extract_features.py writes for APPA-REAL: row-stochastic ``p*``
+    per image), use it. Old caches that pre-date the targets contract
+    (and the synthetic test fixtures that don't yield labels) fall
+    back to uniform-stub labels — those callers are training-recipe
+    tests that don't measure loss anyway.
+    """
     cache_file = cache_dir / f"{split}.npz"
     if not cache_file.exists():
         msg = f"feature cache not found at {cache_file}; run extract_features.py first."
@@ -332,9 +340,14 @@ def _make_linear_probe_provider(
     n = features.shape[0]
     feature_dim = int(features.shape[1])
     num_classes = int(dataset_config.get("metadata", {}).get("num_classes", 0))
-    # In real APPA-REAL the labels come from p* over age_support; tests
-    # pass providers in directly so we use uniform soft labels here.
-    labels = np.full((n, max(num_classes, 1)), 1.0 / max(num_classes, 1), dtype=np.float32)
+    if "targets" in blob.files:
+        labels = np.asarray(blob["targets"], dtype=np.float32)
+        if num_classes <= 0:
+            num_classes = int(labels.shape[1])
+    else:
+        labels = np.full(
+            (n, max(num_classes, 1)), 1.0 / max(num_classes, 1), dtype=np.float32
+        )
     indices = np.arange(n, dtype=np.int64)
     batches = []
     for start in range(0, n, batch_size):

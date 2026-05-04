@@ -66,22 +66,33 @@ def _resolve_callable(dotted: str) -> Any:  # noqa: ANN401
 def _build_backbone(arch: str, weights_path: Path) -> nn.Module:
     """Instantiate the backbone and load weights into it.
 
-    Loads the full state-dict first (so ``strict=True`` matches the
-    saved checkpoint), then replaces the trailing classification head
-    with :class:`torch.nn.Identity` so the module returns features.
-    Works for the locked default ``torchvision.models.resnet101`` and
-    for the smoke-test fixture (a tiny ``nn.Module`` with a ``.fc``).
+    Replaces the trailing classification head with :class:`torch.nn.Identity`
+    BEFORE loading the state dict, then loads with ``strict=True``. Doing
+    the swap first means we accept either head-stripped checkpoints (the
+    user-supplied APPA-REAL backbone has no ``fc.*`` keys) or full-head
+    checkpoints (we'd then drop the ``fc.*`` rows; raises if those are
+    the only mismatches). Works for the locked default
+    ``torchvision.models.resnet101`` and for the smoke-test fixture
+    (a tiny ``nn.Module`` with a ``.fc``).
     """
     factory = _resolve_callable(arch)
     backbone = factory()
-    state_dict = torch.load(weights_path, map_location="cpu", weights_only=False)
-    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
-        state_dict = state_dict["state_dict"]
-    backbone.load_state_dict(state_dict, strict=True)
     if hasattr(backbone, "fc") and isinstance(backbone.fc, nn.Module):
         backbone.fc = nn.Identity()
     elif hasattr(backbone, "classifier") and isinstance(backbone.classifier, nn.Module):
         backbone.classifier = nn.Identity()
+    state_dict = torch.load(weights_path, map_location="cpu", weights_only=False)
+    if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
+        state_dict = state_dict["state_dict"]
+    # Drop any ``fc.*`` / ``classifier.*`` rows the saved file might still
+    # carry: ``Identity`` has no parameters, so ``strict=True`` would
+    # otherwise flag them as "unexpected keys". The encoder rows must
+    # still match exactly.
+    head_prefixes = ("fc.", "classifier.")
+    state_dict = {
+        k: v for k, v in state_dict.items() if not any(k.startswith(p) for p in head_prefixes)
+    }
+    backbone.load_state_dict(state_dict, strict=True)
     backbone.eval()
     return backbone
 
@@ -105,25 +116,53 @@ def _extract_features_for_split(
     dataset: Any,  # noqa: ANN401
     feature_dim: int,
     batch_size: int = 32,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """Run ``backbone`` over every dataset item.
 
-    Returns ``(features, filenames)``. ``filenames`` is the dataset's
-    own per-item filename when exposed; otherwise the integer index
-    cast to string.
+    Runs on GPU when one is available; falls back to CPU otherwise.
+    The backbone is moved to the selected device once before the
+    loop (it is frozen during feature extraction); per-batch tensors
+    are then transferred just-in-time.
+
+    Returns ``(features, filenames, targets)``. ``filenames`` is the
+    dataset's own per-item filename when exposed; otherwise the
+    integer index cast to string. ``targets`` is a ``(N, K)``
+    row-stochastic float32 array when the dataset's ``__getitem__``
+    yields ``(image, soft_labels)`` tuples (the AppaReal contract);
+    ``None`` when the dataset is image-only (the synthetic fixtures
+    in test_extract_features). Caching ``targets`` alongside features
+    is what lets the linear-probe head train against real ``p*``
+    rather than the uniform stub labels :mod:`fit_uncertainty` falls
+    back to when the cache lacks them.
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n = len(dataset)
     features = np.zeros((n, feature_dim), dtype=np.float32)
     filenames: list[str] = []
+    targets: np.ndarray | None = None
+    backbone = backbone.to(device)
     backbone.eval()
     with torch.no_grad():
         for start in range(0, n, batch_size):
             stop = min(start + batch_size, n)
             xs = []
+            ys: list[torch.Tensor] = []
             for i in range(start, stop):
                 item = dataset[i]
                 if isinstance(item, tuple):
                     image = item[0]
+                    if len(item) >= 2:
+                        target = item[1]
+                        if not torch.is_tensor(target):
+                            target = torch.as_tensor(target)
+                        # Only treat the second element as a soft-label
+                        # vector when it is at least 1-D. Scalar
+                        # integer labels (e.g. the smoke-test
+                        # fixture's ``return (image, 0)``) are
+                        # ignored so we don't end up with a degenerate
+                        # ``(N,)`` target array.
+                        if target.ndim >= 1:
+                            ys.append(target.to(torch.float32))
                 else:
                     image = item
                 if not torch.is_tensor(image):
@@ -134,12 +173,25 @@ def _extract_features_for_split(
                     filenames.append(str(fname[i]))
                 else:
                     filenames.append(str(i))
-            batch = torch.stack(xs, dim=0).to(torch.float32)
+            batch = torch.stack(xs, dim=0).to(device, dtype=torch.float32, non_blocking=True)
             out = backbone(batch)
             if out.ndim > 2:
                 out = out.flatten(1)
             features[start:stop] = out.detach().cpu().numpy().astype(np.float32, copy=False)
-    return features, np.asarray(filenames, dtype=object)
+            if ys:
+                if targets is None:
+                    k = int(ys[0].shape[-1]) if ys[0].ndim >= 1 else 1
+                    targets = np.zeros((n, k), dtype=np.float32)
+                stacked = torch.stack(ys, dim=0).cpu().numpy().astype(np.float32, copy=False)
+                # Normalize each row to a probability vector. AppaReal
+                # yields raw integer vote counts; the wrappers' soft-
+                # label CE expects row-stochastic targets. Rows that
+                # are already normalized stay unchanged within
+                # float32 tolerance.
+                row_sums = stacked.sum(axis=1, keepdims=True)
+                row_sums = np.where(row_sums == 0, 1.0, row_sums)
+                targets[start:stop] = stacked / row_sums
+    return features, np.asarray(filenames, dtype=object), targets
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -210,10 +262,23 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"cache hit for split={split}; skipping (sidecar matches).")
                 continue
         dataset = _split_dataloader(dataset_config, split)
-        features, filenames = _extract_features_for_split(backbone, dataset, feature_dim)
-        np.savez_compressed(cache_file, features=features, filenames=filenames)
+        features, filenames, targets = _extract_features_for_split(
+            backbone, dataset, feature_dim
+        )
+        if targets is not None:
+            np.savez_compressed(
+                cache_file,
+                features=features,
+                filenames=filenames,
+                targets=targets,
+            )
+        else:
+            np.savez_compressed(cache_file, features=features, filenames=filenames)
         sidecar.write_text(cfg_hash)
-        print(f"wrote {cache_file} ({features.shape[0]} samples).")
+        print(
+            f"wrote {cache_file} ({features.shape[0]} samples"
+            f"{', with targets' if targets is not None else ''})."
+        )
 
     return 0
 

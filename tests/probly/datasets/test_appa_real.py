@@ -153,6 +153,43 @@ def test_mock_loader_raises_with_listed_columns_when_no_age_column(tmp_path: Pat
         AppaReal(root=tmp_path, split="test")
 
 
+def test_use_face_crops_rewrites_filenames(tmp_path: Path) -> None:
+    """``use_face_crops=True`` resolves ``X.jpg`` to ``X.jpg_face.jpg``.
+
+    The CVPR 2017 release ships a face crop for every original at the
+    suffixed filename. The CSV references the originals; the loader's
+    flag swaps the in-memory filename so all downstream lookups
+    (``__getitem__``, ``vote_counts``, ``image_filenames``) point at
+    the crops.
+    """
+    test_dir = tmp_path / "test"
+    test_dir.mkdir()
+    _write_dummy_image(test_dir / "a.jpg")
+    _write_dummy_image(test_dir / "a.jpg_face.jpg")
+    _write_dummy_image(test_dir / "b.jpg")
+    _write_dummy_image(test_dir / "b.jpg_face.jpg")
+    csv_path = tmp_path / "gt_test.csv"
+    csv_path.write_text("file_name,apparent_age\na.jpg,25\na.jpg,30\nb.jpg,30\n")
+
+    dataset = AppaReal(root=tmp_path, split="test", use_face_crops=True)
+    assert sorted(dataset.image_filenames) == ["a.jpg_face.jpg", "b.jpg_face.jpg"]
+    assert "a.jpg" not in dataset.vote_counts
+    assert "a.jpg_face.jpg" in dataset.vote_counts
+    # __getitem__ resolves to the crop file (would FileNotFoundError if
+    # the rewrite hadn't happened).
+    image, counts = dataset[0]
+    assert isinstance(image, torch.Tensor)
+    assert counts.sum().item() > 0
+
+
+def test_use_face_crops_default_is_false_back_compat(tmp_path: Path) -> None:
+    """Default behaviour is unchanged: lookups go to the CSV's file_name as-is."""
+    root = _build_mock_dataset(tmp_path)
+    dataset = AppaReal(root=root, split="test")
+    assert sorted(dataset.image_filenames) == ["a.jpg", "b.jpg"]
+    assert "a.jpg_face.jpg" not in dataset.vote_counts
+
+
 def test_compute_global_support_unions_all_splits(tmp_path: Path) -> None:
     for split, ages in (("train", [10, 20]), ("valid", [20, 30]), ("test", [25, 30])):
         split_dir = tmp_path / split

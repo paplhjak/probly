@@ -7,22 +7,38 @@
 # consume scalar (A_hat, E_hat) per loss without knowing which loss
 # produced them.
 #
-# The default support is the per-split union of observed integer ages.
-# For the paper's main results we override age_support at runtime with
-#   support = AppaReal.compute_global_support(root)
-# so that A* / E* oracle computations are comparable across splits.
+# We use the locked global age support [0..100] -- empirically
+# verified to be the union of apparent_age votes across train + valid
+# + test. Pinning the support here (rather than computing it via
+# AppaReal.compute_global_support at runtime) keeps oracle outputs
+# identical across split-specific runs without an extra pass over
+# the CSVs.
+#
+# We use the face crops (final_files release) per the locked decision
+# in decisions.md "APPA-REAL data". The CSV references original
+# filenames X.jpg; ``loader_kwargs.use_face_crops: true`` rewrites
+# them to ``X.jpg_face.jpg`` before the loader resolves images on
+# disk.
 
 name: appa_real
 loader:
   module: probly.datasets.appa_real
   class: AppaReal
 loader_kwargs:
-  root: data/appa_real
+  root: data/appa-real-release
   split: test
-  # age_support is filled at runtime by:
-  #   support = AppaReal.compute_global_support(root)
-  # See decisions.md "APPA-REAL deployment losses" for why the global
-  # support is used for the paper's main results.
+  use_face_crops: true
+  # Locked global integer-age support: every age 0..100 inclusive
+  # appears at least once across train+valid+test (verified
+  # 2026-05-04). Pinning here so train / valid / test loaders agree on
+  # column ordering for the dense vote-count tensor.
+  age_support:
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+     20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37,
+     38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
+     56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73,
+     74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91,
+     92, 93, 94, 95, 96, 97, 98, 99, 100]
 supported_losses: [squared, absolute]
 extraction_mode: linear_probe
 backbone:
@@ -30,13 +46,25 @@ backbone:
   weights_path: experiments/epistemic_eval/assets/appa_real_backbone/weights.pth
   feature_dim: 2048
   preprocessing:
-    image_size: [256, 256]
+    image_size: [224, 224]
     normalization:
       mean: [0.485, 0.456, 0.406]
       std:  [0.229, 0.224, 0.225]
 head:
   architecture: probly.method.head.MlpHead
-  hidden: 256
+  # Hidden dim is shared by every method's head over APPA-REAL
+  # features (mc_dropout, ensemble, evidential, ddu). 128 is the
+  # canonical linear-probe head size for an already-discriminative
+  # 2048-d feature space (Chen et al. SimCLR, He et al. MAE). The
+  # bigger 512-hidden bumps tested earlier left training at the
+  # entropy floor (~2.43 nats vs train_loss ~2.7), so capacity
+  # wasn't the bottleneck; ensemble diversity is now driven by
+  # per-member train rotation rather than head-size-induced loss
+  # multi-modality. Smaller head also lessens DDU's GMM
+  # under-determination (the 101-class density head has
+  # ``hidden(hidden+1)/2 = 8 256`` covariance params per component,
+  # cf. 131k at hidden=512).
+  hidden: 128
 training:
   optimizer: adamw
   lr: 1.0e-3
@@ -44,5 +72,37 @@ training:
   batch_size: 128
   epochs: 50
   schedule: cosine
+  # Driven into the method wrappers. APPA-REAL uses linear-probe
+  # mode: a 2048->256->101 MlpHead over cached backbone features.
+  # SGD-cosine (the locked default in the method YAMLs) underfits a
+  # head this small at lr=1e-3 because the cosine schedule decays the
+  # LR to ~0 by epoch ~40. We opt into AdamW for ensemble + evidential
+  # via the explicit ``optimizer`` field; mc_dropout's wrapper is
+  # already AdamW-only. With these values:
+  #   * mc_dropout  -> AdamW lr=1e-3, wd=1e-4, 50 epochs (constant LR)
+  #   * ensemble    -> AdamW lr=1e-3, wd=1e-4, 50 epochs (cosine)
+  #   * evidential  -> AdamW lr=1e-3, wd=1e-4, 50 epochs (cosine)
+  # ``optimizer: adamw`` is the explicit opt-in; default is SGD.
+  method_overrides:
+    optimizer: adamw
+    epochs: 50
+    lr: 1.0e-3
+    weight_decay: 1.0e-4
+    # Per-member train rotation: each ensemble member drops a different
+    # 1/5 of the train pool (deterministic 5-fold partition). Adds
+    # data-side diversity beyond random init, which is the structural
+    # missing ingredient in the frozen-features regime where members
+    # otherwise converge to nearly the same head. Ignored by mc_dropout
+    # (one model) and evidential (one model) -- the flag only affects
+    # ensemble's per-member loop in ensemble.fit().
+    per_member_train_rotation: true
 metadata:
-  notes: "Apparent age, integer-vote histogram over age_support."
+  num_classes: 101
+  notes: >-
+    Apparent age, integer-vote histogram over age_support [0..100].
+    101 classes treated as ordinal-discrete, evaluated under squared
+    AND absolute losses (both primary). Frozen ResNet-101 backbone
+    (CSFD16-pretrained, head-stripped, 170 MB at
+    experiments/epistemic_eval/assets/appa_real_backbone/weights.pth);
+    head is the only trainable component and is sized 2048 -> 256 ->
+    101.

@@ -85,13 +85,13 @@ def test_all_dcic_yamls_share_the_same_recipe() -> None:
         "lr": 3.0e-4,
         "weight_decay": 1.0e-4,
         "batch_size": 32,
-        "epochs": 200,
-        "patience": 100,
+        "epochs": 100,
+        "patience": 20,
         "val_fraction": 0.1,
         "schedule": "cosine",
     }
     canonical_overrides = {
-        "epochs": 200,
+        "epochs": 100,
         "lr": 3.0e-3,
         "momentum": 0.9,
         "nesterov": False,
