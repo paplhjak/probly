@@ -44,6 +44,8 @@ _CSV_COLUMNS = (
     "loss",
     "seed",
     "aurec",
+    "excess_aurec",
+    "n_aurec",
     "aurc",
     "pareto_gap",
     "n_test_points",
@@ -103,13 +105,17 @@ def _group_by_dataset_loss(
 
 def _aggregate_method_cell(
     method_rows: list[dict[str, Any]],
-) -> tuple[str, str, str, int]:
-    """Return (aurec_str, aurc_str, pareto_gap_str, n_seeds)."""
+) -> tuple[str, str, str, str, str, int]:
+    """Return (aurec_str, excess_aurec_str, n_aurec_str, aurc_str, pareto_gap_str, n_seeds)."""
     aurec_values = [float(r["aurec"]) for r in method_rows]
+    excess_values = [float(r["excess_aurec"]) for r in method_rows]
+    n_aurec_values = [float(r["n_aurec"]) for r in method_rows]
     aurc_values = [float(r["aurc"]) for r in method_rows]
     gap_values = [float(r["pareto_gap"]) for r in method_rows]
     return (
         _format_mean_std(aurec_values),
+        _format_mean_std(excess_values),
+        _format_mean_std(n_aurec_values),
         _format_mean_std(aurc_values),
         _format_mean_std(gap_values),
         len(method_rows),
@@ -135,12 +141,21 @@ def _render_markdown(
             per_method.setdefault(str(r.get("method", "")), []).append(r)
         method_summaries = []
         for method, m_rows in per_method.items():
-            aurec_str, aurc_str, gap_str, n_seeds = _aggregate_method_cell(m_rows)
+            (
+                aurec_str,
+                excess_str,
+                n_aurec_str,
+                aurc_str,
+                gap_str,
+                n_seeds,
+            ) = _aggregate_method_cell(m_rows)
             aurec_mean = sum(float(r["aurec"]) for r in m_rows) / len(m_rows)
             method_summaries.append(
                 {
                     "method": method,
                     "aurec_str": aurec_str,
+                    "excess_str": excess_str,
+                    "n_aurec_str": n_aurec_str,
                     "aurc_str": aurc_str,
                     "gap_str": gap_str,
                     "n_seeds": n_seeds,
@@ -152,15 +167,21 @@ def _render_markdown(
         lines.append(f"## {dataset} -- {loss}")
         lines.append("")
         lines.append(
-            "| method | AuReC (mean +/- std) | AuRC (mean +/- std) | "
+            "| method | AuReC (mean +/- std) | excess AuReC (mean +/- std) | "
+            "n_AuReC (mean +/- std) | AuRC (mean +/- std) | "
             "Pareto-gap (mean +/- std) | n_seeds |"
         )
-        lines.append("|--------|----------------------|----------------------|"
-                     "---------------------------|---------|")
+        lines.append(
+            "|--------|----------------------|------------------------------|"
+            "------------------------|----------------------|"
+            "---------------------------|---------|"
+        )
         for entry in method_summaries:
             lines.append(
-                f"| {entry['method']} | {entry['aurec_str']} | {entry['aurc_str']} | "
-                f"{entry['gap_str']} | {entry['n_seeds']} |"
+                f"| {entry['method']} | {entry['aurec_str']} | "
+                f"{entry['excess_str']} | {entry['n_aurec_str']} | "
+                f"{entry['aurc_str']} | {entry['gap_str']} | "
+                f"{entry['n_seeds']} |"
             )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
