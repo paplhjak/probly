@@ -48,7 +48,12 @@ from torch import nn
 from probly.method.ddu import ddu
 from probly.predictor import LogitClassifier
 
-from ._base import FeatureProvider, setup_determinism
+from ._base import (
+    FeatureProvider,
+    build_optimizer,
+    setup_determinism,
+    train_with_val_tracking,
+)
 
 
 @dataclass
@@ -89,6 +94,8 @@ def _train_ddu_classifier(
     data_provider: FeatureProvider,
     method_config: dict[str, Any],
     seed: int,
+    *,
+    val_provider: FeatureProvider | None = None,
 ) -> nn.Module:
     """Train the DDU predictor's classifier on soft-label CE.
 
@@ -115,68 +122,39 @@ def _train_ddu_classifier(
     """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
-    lr = float(method_config.get("lr", 1.0e-3))
-    weight_decay = float(method_config.get("weight_decay", 0.0))
-    momentum = float(method_config.get("momentum", 0.9))
-    nesterov = bool(method_config.get("nesterov", False))
-    optimizer_name = str(method_config.get("optimizer", "sgd")).lower()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ddu_predictor = ddu_predictor.to(device)
-
-    # Optimizer dispatch: SGD by default (cross-method recipe-uniformity
-    # decision); ``training.method_overrides.optimizer: adamw`` opts into
-    # AdamW for the linear-probe regime where SGD-cosine underfits a
-    # small head over cached features. See ensemble._train_member for
-    # the same dispatch.
-    optimizer: torch.optim.Optimizer
-    if optimizer_name == "sgd":
-        optimizer = torch.optim.SGD(
-            [p for p in ddu_predictor.parameters() if p.requires_grad],
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-        )
-    elif optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(
-            [p for p in ddu_predictor.parameters() if p.requires_grad],
-            lr=lr,
-            weight_decay=weight_decay,
-        )
-    else:
-        msg = (
-            f"unknown optimizer {optimizer_name!r} for ddu; "
-            f"expected 'sgd' (default) or 'adamw'."
-        )
-        raise ValueError(msg)
+    optimizer = build_optimizer(
+        ddu_predictor,
+        optimizer_name=str(method_config.get("optimizer", "sgd")).lower(),
+        lr=float(method_config.get("lr", 1.0e-3)),
+        momentum=float(method_config.get("momentum", 0.9)),
+        weight_decay=float(method_config.get("weight_decay", 0.0)),
+        nesterov=bool(method_config.get("nesterov", False)),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(epochs, 1)
     )
-    ddu_predictor.train()
-    for epoch in range(epochs):
-        lr_now = float(scheduler.get_last_lr()[0])
-        epoch_loss = 0.0
-        n_batches = 0
-        for x, y in data_provider:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            logits, _ = ddu_predictor(x)
-            log_probs = torch.log_softmax(logits, dim=1)
-            loss = -(y * log_probs).sum(dim=1).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += float(loss.detach().item())
-            n_batches += 1
-        train_loss = epoch_loss / max(n_batches, 1)
-        print(
-            f"epoch {epoch + 1}/{epochs}: "
-            f"train_loss={train_loss:.4f} lr={lr_now:.4f}",
-            flush=True,
-        )
-        scheduler.step()
-    return ddu_predictor
+
+    # DDU's forward returns ``(logits, per_class_log_density)``; we
+    # train Phase A against the logits with the standard soft-label
+    # CE. The density head is fit post-hoc in :func:`_fit_density_head`.
+    def _ddu_compute_loss(
+        model: nn.Module, x: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
+        logits, _ = model(x)
+        log_probs = torch.log_softmax(logits, dim=1)
+        return -(y * log_probs).sum(dim=1).mean()
+
+    return train_with_val_tracking(
+        ddu_predictor,
+        data_provider,
+        val_provider,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epochs=epochs,
+        compute_loss=_ddu_compute_loss,
+    )
 
 
 def _fit_density_head(
@@ -258,6 +236,8 @@ def fit(
     data_provider: FeatureProvider,
     model_factory: Callable[[], nn.Module],
     seed: int,
+    *,
+    val_data_provider: FeatureProvider | None = None,
 ) -> DDUHandle:
     """Train a DDU predictor end-to-end and return its handle.
 
@@ -287,7 +267,13 @@ def fit(
     LogitClassifier.register_instance(base_model)
     sn_coeff = float(method_config.get("sn_coeff", 3.0))
     ddu_predictor = ddu(base_model, sn_coeff=sn_coeff)
-    trained = _train_ddu_classifier(ddu_predictor, data_provider, method_config, seed)
+    trained = _train_ddu_classifier(
+        ddu_predictor,
+        data_provider,
+        method_config,
+        seed,
+        val_provider=val_data_provider,
+    )
     _fit_density_head(trained, data_provider)
     head_factory_args = method_config.get("head_factory_args")
     return DDUHandle(

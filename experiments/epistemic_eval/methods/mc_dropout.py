@@ -144,6 +144,8 @@ def fit(
     data_provider: FeatureProvider,
     model_factory: Callable[[], nn.Module],
     seed: int,
+    *,
+    val_data_provider: FeatureProvider | None = None,  # noqa: ARG001
 ) -> McDropoutHandle:
     """Train a single classifier with dropout active.
 

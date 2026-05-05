@@ -42,6 +42,20 @@ from experiments.epistemic_eval.methods._base import FeatureProvider  # noqa: E4
 from experiments.epistemic_eval.scripts import fit_uncertainty  # noqa: E402
 
 
+def _build_synthetic_provider(n_batches: int) -> FeatureProvider:
+    """Build a small synthetic FeatureProvider with ``n_batches`` batches."""
+    batch_x = torch.zeros(2, 16, dtype=torch.float32)
+    batch_y = torch.zeros(2, 3, dtype=torch.float32)
+    batch_y[:, 0] = 1.0
+    return FeatureProvider(
+        batches=[(batch_x, batch_y)] * n_batches,
+        mode="full_network",
+        feature_dim=None,
+        n_classes=3,
+        indices=np.arange(2, dtype=np.int64),
+    )
+
+
 def _synthetic_train_provider(_dataset_config: dict[str, Any]) -> FeatureProvider:
     """Stand-in for ``_make_full_network_cifar10h_train_provider``.
 
@@ -50,16 +64,20 @@ def _synthetic_train_provider(_dataset_config: dict[str, Any]) -> FeatureProvide
     batches" without paying the cost of loading 50k CIFAR-10
     images.
     """
-    batch_x = torch.zeros(2, 16, dtype=torch.float32)
-    batch_y = torch.zeros(2, 3, dtype=torch.float32)
-    batch_y[:, 0] = 1.0
-    return FeatureProvider(
-        batches=[(batch_x, batch_y)],
-        mode="full_network",
-        feature_dim=None,
-        n_classes=3,
-        indices=np.arange(2, dtype=np.int64),
-    )
+    return _build_synthetic_provider(n_batches=1)
+
+
+def _synthetic_train_val_providers(
+    _dataset_config: dict[str, Any], **_kwargs: Any
+) -> tuple[FeatureProvider, FeatureProvider]:
+    """Stand-in for ``_make_full_network_cifar10h_train_val_providers``.
+
+    Returns ``(train, val)`` providers; the train side has 1 batch
+    (the regression sentinel from the original routing test) and the
+    val side has 1 small batch so val-tracking does not silently
+    short-circuit on zero-length val sets.
+    """
+    return _build_synthetic_provider(n_batches=1), _build_synthetic_provider(n_batches=1)
 
 
 def _install_recording_method(
@@ -89,12 +107,17 @@ def _install_recording_method(
         data_provider: FeatureProvider,
         model_factory: Any = None,  # noqa: ANN401, ARG001
         seed: int = 0,
+        *,
+        val_data_provider: FeatureProvider | None = None,
     ) -> _FakeHandle:
         # Materialise the iterator so we can count batches without
         # mutating the FeatureProvider's internal list.
         batches = list(data_provider)
         received["n_batches"] = len(batches)
         received["provider_mode"] = data_provider.mode
+        received["val_provider_present"] = val_data_provider is not None
+        if val_data_provider is not None:
+            received["n_val_batches"] = len(list(val_data_provider))
         return _FakeHandle(
             method_config=method_config,
             dataset_config=dataset_config,
@@ -163,8 +186,8 @@ def test_from_scratch_methods_get_real_train_provider(
     # in a unit test.
     monkeypatch.setattr(
         fit_uncertainty,
-        "_make_full_network_cifar10h_train_provider",
-        _synthetic_train_provider,
+        "_make_full_network_cifar10h_train_val_providers",
+        _synthetic_train_val_providers,
     )
 
     method_path, dataset_path = _write_configs(
@@ -218,13 +241,15 @@ def test_mc_dropout_still_uses_stub_provider(
     # If routing falls through to mc_dropout's branch correctly the
     # train-provider builder is never called; if the stub providers
     # the wrong path, this hot-fail would surface a regression.
-    def _should_not_be_called(_dataset_config: dict[str, Any]) -> FeatureProvider:
-        msg = "mc_dropout must not invoke _make_full_network_cifar10h_train_provider"
+    def _should_not_be_called(
+        _dataset_config: dict[str, Any], **_kwargs: Any
+    ) -> tuple[FeatureProvider, FeatureProvider]:
+        msg = "mc_dropout must not invoke _make_full_network_cifar10h_train_val_providers"
         raise AssertionError(msg)
 
     monkeypatch.setattr(
         fit_uncertainty,
-        "_make_full_network_cifar10h_train_provider",
+        "_make_full_network_cifar10h_train_val_providers",
         _should_not_be_called,
     )
 

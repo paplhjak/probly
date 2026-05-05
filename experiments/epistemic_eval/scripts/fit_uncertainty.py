@@ -222,16 +222,38 @@ def _make_full_network_cifar10h_train_provider(
     dataset_config: dict[str, Any],
     batch_size: int = 128,
 ) -> FeatureProvider:
-    """Build a real CIFAR-10H training provider for from-scratch ensembles.
+    """Backwards-compatible single-provider entry point.
 
-    Used by the ensemble path that trains each member from scratch
-    (no ``ensemble_classifier_paths`` and no pretrained checkpoint
-    in the dataset config). Wraps :class:`CIFAR10NoMD5` with
-    train-time transforms (``RandomCrop`` + ``RandomHorizontalFlip`` +
-    ``Normalize``) and a ``DataLoader(shuffle=True)`` so augmentation
-    re-randomises every epoch and labels are one-hotted into ``(B, K)``
-    floats at fetch time for the soft-label cross-entropy used by
-    ``ensemble._train_member`` and the other from-scratch UQ paths.
+    Returns just the train provider produced by
+    :func:`_make_full_network_cifar10h_train_val_providers`. Kept so
+    the existing ``test_fit_uncertainty_routing.py`` monkeypatch (which
+    targets this name) keeps working without a test rewrite. New
+    callers should use the train-val variant directly to enable
+    best-val-loss epoch selection.
+    """
+    train_provider, _val_provider = _make_full_network_cifar10h_train_val_providers(
+        dataset_config, batch_size=batch_size
+    )
+    return train_provider
+
+
+def _make_full_network_cifar10h_train_val_providers(
+    dataset_config: dict[str, Any],
+    *,
+    seed: int = 0,
+    val_fraction: float = 0.1,
+    batch_size: int = 128,
+) -> tuple[FeatureProvider, FeatureProvider]:
+    """Build (train, val) providers for from-scratch UQ training on CIFAR-10H.
+
+    Mirrors the basecls trainer's split (``train_classifier.py``):
+    90/10 of the 50k CIFAR-10 train images, with random-crop +
+    horizontal-flip + normalisation on the train side and
+    normalisation-only (no augmentation, no shuffle) on the val side
+    so val_loss is comparable across epochs. The val provider feeds
+    :func:`_base.train_with_val_tracking` so the from-scratch UQ
+    paths (ensemble, evidential, ddu) save the best-val-loss state
+    rather than the final-epoch state.
     """
     from torchvision import transforms as T  # noqa: PLC0415
 
@@ -241,41 +263,71 @@ def _make_full_network_cifar10h_train_provider(
 
     norm = dataset_config["training"]["normalization"]
     crop = dataset_config["training"]["augmentation"].get("random_crop", {})
-    transforms_list: list[Any] = []
+    train_transforms_list: list[Any] = []
     if crop:
-        transforms_list.append(T.RandomCrop(int(crop["size"]), padding=int(crop.get("padding", 0))))
+        train_transforms_list.append(
+            T.RandomCrop(int(crop["size"]), padding=int(crop.get("padding", 0)))
+        )
     if dataset_config["training"]["augmentation"].get("horizontal_flip"):
-        transforms_list.append(T.RandomHorizontalFlip())
-    transforms_list.extend([
+        train_transforms_list.append(T.RandomHorizontalFlip())
+    train_transforms_list.extend([
         T.ToTensor(),
         T.Normalize(tuple(float(x) for x in norm["mean"]), tuple(float(x) for x in norm["std"])),
     ])
-    transform = T.Compose(transforms_list)
+    train_transform = T.Compose(train_transforms_list)
+    val_transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize(tuple(float(x) for x in norm["mean"]), tuple(float(x) for x in norm["std"])),
+    ])
 
     cifar_root = dataset_config.get("loader_kwargs", {}).get("root", "data/cifar10h")
-    train_ds = CIFAR10NoMD5(root=cifar_root, train=True, transform=transform)
     num_classes = int(dataset_config.get("classifier", {}).get("num_classes", 10))
-    one_hot_ds = _OneHotCIFAR10(train_ds, num_classes=num_classes)
-    n = len(one_hot_ds)
-    indices = np.arange(n, dtype=np.int64)
+    train_ds_aug = CIFAR10NoMD5(root=cifar_root, train=True, transform=train_transform)
+    train_ds_clean = CIFAR10NoMD5(root=cifar_root, train=True, transform=val_transform)
+    one_hot_train = _OneHotCIFAR10(train_ds_aug, num_classes=num_classes)
+    one_hot_val = _OneHotCIFAR10(train_ds_clean, num_classes=num_classes)
+
+    n = len(one_hot_train)
+    val_size = max(1, int(val_fraction * n))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    val_idx = perm[:val_size].tolist()
+    train_idx = perm[val_size:].tolist()
+
+    train_subset = torch.utils.data.Subset(one_hot_train, train_idx)
+    val_subset = torch.utils.data.Subset(one_hot_val, val_idx)
 
     pin_memory = bool(torch.cuda.is_available())
-    dataloader: torch.utils.data.DataLoader[Any] = torch.utils.data.DataLoader(
-        one_hot_ds,
+    train_loader: torch.utils.data.DataLoader[Any] = torch.utils.data.DataLoader(
+        train_subset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
         pin_memory=pin_memory,
     )
+    val_loader: torch.utils.data.DataLoader[Any] = torch.utils.data.DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
 
-    provider = _DataLoaderProvider(
-        dataloader=dataloader,
+    train_provider = _DataLoaderProvider(
+        dataloader=train_loader,
         n_classes=num_classes,
-        indices=indices,
+        indices=np.asarray(train_idx, dtype=np.int64),
         mode="full_network",
         feature_dim=None,
     )
-    return cast("FeatureProvider", provider)
+    val_provider = _DataLoaderProvider(
+        dataloader=val_loader,
+        n_classes=num_classes,
+        indices=np.asarray(val_idx, dtype=np.int64),
+        mode="full_network",
+        feature_dim=None,
+    )
+    return cast("FeatureProvider", train_provider), cast("FeatureProvider", val_provider)
 
 
 def _make_full_network_stub_provider(
@@ -464,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
     if method_overrides:
         method_config_with_args.update(dict(method_overrides))
 
+    val_provider: FeatureProvider | None = None
     if extraction_mode == "linear_probe":
         factory, head_factory_args = _build_head_factory(dataset_config, method_config)
         provider = _make_linear_probe_provider(
@@ -513,19 +566,25 @@ def main(argv: list[str] | None = None) -> int:
             # with one of the frozen ensemble checkpoint sets.
             dataset_name = dataset_config.get("name")
             if dataset_name == "cifar10h":
-                provider = _make_full_network_cifar10h_train_provider(dataset_config)
+                training_block = dataset_config.get("training", {}) or {}
+                provider, val_provider = _make_full_network_cifar10h_train_val_providers(
+                    dataset_config,
+                    seed=args.seed,
+                    val_fraction=float(training_block.get("val_fraction", 0.1)),
+                    batch_size=int(training_block.get("batch_size", 128)),
+                )
             elif dataset_config.get("family") == "dcic":
                 from experiments.epistemic_eval.datasets.dcic import (  # noqa: PLC0415
-                    build_full_train_provider,
+                    build_train_val_providers,
                 )
 
                 training_block = dataset_config.get("training", {}) or {}
-                provider = build_full_train_provider(
+                provider, val_provider = build_train_val_providers(
                     dataset_config,
                     seed=args.seed,
+                    val_fraction=float(training_block.get("val_fraction", 0.1)),
                     batch_size=int(training_block.get("batch_size", 32)),
                     num_workers=int(training_block.get("num_workers", 0)),
-                    augment=True,
                 )
                 # Guard against the config/data num_classes mismatch
                 # that bit MiceBone (DCIC README said 4, the data has
@@ -579,13 +638,18 @@ def main(argv: list[str] | None = None) -> int:
             if method_name == "mc_dropout":
                 method_config_with_args["epochs"] = 0
 
-    handle = method_module.fit(
-        method_config=method_config_with_args,
-        dataset_config=dataset_config,
-        data_provider=provider,
-        model_factory=factory,
-        seed=args.seed,
-    )
+    fit_kwargs: dict[str, Any] = {
+        "method_config": method_config_with_args,
+        "dataset_config": dataset_config,
+        "data_provider": provider,
+        "model_factory": factory,
+        "seed": args.seed,
+    }
+    # Pass the val provider only when one exists, so the existing test
+    # fakes (which don't accept ``val_data_provider``) keep working.
+    if val_provider is not None:
+        fit_kwargs["val_data_provider"] = val_provider
+    handle = method_module.fit(**fit_kwargs)
 
     run_dir = args.run_dir or (
         _REPO_ROOT / "experiments/epistemic_eval/runs"

@@ -25,10 +25,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
-from typing import Any, Iterator, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Protocol, runtime_checkable
 
 import numpy as np
 import torch
+from torch import nn
 
 
 def derive_member_seed(root_seed: int, member_idx: int) -> int:
@@ -191,11 +192,192 @@ def setup_determinism(seed: int) -> None:
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 
+def build_optimizer(
+    model: nn.Module,
+    *,
+    optimizer_name: str,
+    lr: float,
+    momentum: float,
+    weight_decay: float,
+    nesterov: bool,
+) -> torch.optim.Optimizer:
+    """Construct the locked SGD/AdamW optimizer over ``model``'s trainable params.
+
+    Centralises the optimizer dispatch shared by every from-scratch UQ
+    training path (ensemble per-member, evidential, ddu) and by the
+    CIFAR-10H basecls trainer. ``"sgd"`` is the default across UQ
+    methods; ``"adamw"`` is opt-in via the dataset config's
+    ``training.method_overrides.optimizer`` for the linear-probe
+    (APPA-REAL) regime where SGD-cosine underfits a small head over
+    cached features.
+
+    Args:
+        model: The module whose ``requires_grad`` parameters become the
+            optimizer's param group.
+        optimizer_name: ``"sgd"`` or ``"adamw"``.
+        lr: Initial learning rate.
+        momentum: SGD momentum (ignored by AdamW).
+        weight_decay: L2 / decoupled weight decay.
+        nesterov: SGD Nesterov flag (ignored by AdamW).
+
+    Returns:
+        The constructed :class:`torch.optim.Optimizer`.
+
+    Raises:
+        ValueError: If ``optimizer_name`` is neither ``"sgd"`` nor
+            ``"adamw"``.
+    """
+    name = str(optimizer_name).lower()
+    params = [p for p in model.parameters() if p.requires_grad]
+    if name == "sgd":
+        return torch.optim.SGD(
+            params,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+        )
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    msg = f"unknown optimizer {optimizer_name!r}; expected 'sgd' (default) or 'adamw'."
+    raise ValueError(msg)
+
+
+def train_with_val_tracking(
+    model: nn.Module,
+    train_provider: FeatureProvider,
+    val_provider: FeatureProvider | None,
+    *,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    epochs: int,
+    compute_loss: Callable[[nn.Module, torch.Tensor, torch.Tensor], torch.Tensor],
+    progress_prefix: str = "",
+) -> nn.Module:
+    """Train ``model`` for ``epochs``, keeping the best-val-loss state if a val provider is given.
+
+    Centralises the per-epoch training/eval/best-state bookkeeping
+    that previously lived inline in the three from-scratch UQ
+    wrappers (``ensemble._train_member``,
+    ``evidential_classification._train_evidential_model``,
+    ``ddu._train_ddu_classifier``). All three suffered from the same
+    failure mode on CIFAR-10H (pre-fix): with frozen augmentation the
+    train loss bottomed out around epoch 118 then climbed back to
+    ``ln(K)`` (uniform output) by epoch 200, and the *final-epoch*
+    weights were saved -- meaning the cached classifier was
+    effectively a constant predictor. Tracking ``best_val_loss`` and
+    loading that state at the end shields against any future
+    divergence-after-best-epoch trajectory.
+
+    Per-epoch flow:
+
+    1. ``model.train()``; iterate ``train_provider``; call
+       ``compute_loss(model, x, y)`` per batch; backprop; step the
+       optimizer.
+    2. If ``val_provider`` is given, ``model.eval()``; iterate it
+       under ``torch.no_grad()``; aggregate the same
+       ``compute_loss`` value; if the mean is a new best, snapshot
+       ``model.state_dict()`` to CPU.
+    3. Print one progress line.
+    4. ``scheduler.step()``.
+
+    On exit, if a best state was captured, ``model.load_state_dict``
+    restores it. Otherwise ``model`` retains its final-epoch state
+    (the no-val-provider fallback, used for paths that have no held-
+    out split).
+
+    Args:
+        model: Module trained in place; final state matches the
+            best-val-loss epoch when val tracking is on.
+        train_provider: Yields ``(x, y)`` batches for training.
+        val_provider: Yields ``(x, y)`` batches for validation;
+            ``None`` disables val tracking.
+        optimizer: Pre-built optimizer over ``model.parameters()``.
+        scheduler: Pre-built LR scheduler.
+        epochs: Number of epochs.
+        compute_loss: Closure that computes the per-batch loss.
+            Called as ``compute_loss(model, x, y)`` and must return a
+            scalar ``torch.Tensor``. The closure performs the forward
+            pass and is the single point where method-specific
+            forward semantics (logits CE for ensemble/ddu, evidential
+            CE on Dirichlet alphas for evidential) plug in.
+        progress_prefix: String prepended to each per-epoch log line
+            (e.g. ``"member 3/5 "``); empty by default.
+
+    Returns:
+        ``model`` with the best-val-loss state loaded (when val
+        tracking is on) or its final-epoch state (when not).
+    """
+    device = next(model.parameters()).device
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
+    for epoch in range(epochs):
+        # Read the LR active during the epoch we're about to run before
+        # stepping the scheduler; ``get_last_lr()`` returns the most
+        # recently set LR (the initial LR before any ``.step()`` calls).
+        lr_now = float(scheduler.get_last_lr()[0])
+
+        model.train()
+        train_loss_sum = 0.0
+        n_train_batches = 0
+        for x, y in train_provider:
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            loss = compute_loss(model, x, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss_sum += float(loss.detach().item())
+            n_train_batches += 1
+        train_loss = train_loss_sum / max(n_train_batches, 1)
+
+        val_loss: float | None = None
+        if val_provider is not None:
+            model.eval()
+            val_loss_sum = 0.0
+            n_val_batches = 0
+            with torch.no_grad():
+                for x, y in val_provider:
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    loss = compute_loss(model, x, y)
+                    val_loss_sum += float(loss.item())
+                    n_val_batches += 1
+            val_loss = val_loss_sum / max(n_val_batches, 1)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
+
+        if val_loss is not None:
+            print(
+                f"{progress_prefix}epoch {epoch + 1}/{epochs}: "
+                f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+                f"lr={lr_now:.4f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"{progress_prefix}epoch {epoch + 1}/{epochs}: "
+                f"train_loss={train_loss:.4f} lr={lr_now:.4f}",
+                flush=True,
+            )
+
+        scheduler.step()
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model
+
+
 __all__ = [
     "FeatureProvider",
     "MethodHandle",
+    "build_optimizer",
     "derive_member_seed",
     "hash_config",
     "make_run_id",
     "setup_determinism",
+    "train_with_val_tracking",
 ]

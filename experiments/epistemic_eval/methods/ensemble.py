@@ -44,7 +44,13 @@ import numpy as np
 import torch
 from torch import nn
 
-from ._base import FeatureProvider, derive_member_seed, setup_determinism
+from ._base import (
+    FeatureProvider,
+    build_optimizer,
+    derive_member_seed,
+    setup_determinism,
+    train_with_val_tracking,
+)
 
 
 @dataclass
@@ -158,12 +164,27 @@ def _make_member_subset_provider(
     )
 
 
+def _soft_label_ce(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Soft-label cross-entropy on logit-emitting classifiers.
+
+    ``y`` is a row-stochastic ``(B, K)`` target (one-hot for
+    CIFAR-10/DCIC int labels, or a dense ``p*`` for soft-labelled
+    datasets); ``model(x)`` returns logits ``(B, K)``. Equivalent to
+    :func:`torch.nn.functional.cross_entropy` for one-hot ``y`` and to
+    KL plus entropy for general ``y``.
+    """
+    logits = model(x)
+    log_probs = torch.log_softmax(logits, dim=1)
+    return -(y * log_probs).sum(dim=1).mean()
+
+
 def _train_member(
     model: nn.Module,
     data_provider: FeatureProvider,
     method_config: dict[str, Any],
     seed: int,
     *,
+    val_provider: FeatureProvider | None = None,
     member_idx: int = 0,
     n_members: int = 1,
 ) -> nn.Module:
@@ -176,84 +197,45 @@ def _train_member(
     Optimisation recipe (locked across all four UQ methods, mirrors
     :mod:`scripts.train_classifier`'s basecls path):
     SGD with momentum (Nesterov configurable) and a cosine learning-
-    rate schedule with ``T_max == epochs``. The choice unifies the
-    method comparison: pre-fix, ensemble/evidential/ddu used AdamW
-    while basecls/mc_dropout used SGD-cosine, making the head-to-head
-    recipe-confounded.
+    rate schedule with ``T_max == epochs``.
+
+    When ``val_provider`` is given, val_loss is computed at the end
+    of every epoch and the model state from the lowest-val-loss epoch
+    is restored before returning. This shields against the
+    divergence-after-best-epoch trajectory observed on CIFAR-10H
+    pre-fix (loss reached 2.07 at epoch 118 then climbed back to
+    ``ln(10)`` by epoch 200).
 
     Per-epoch progress is printed to stdout in the format
-    ``member <idx>/<n> epoch <e>/<E>: train_loss=<float> lr=<float>``
-    so SLURM logs surface training progress and silent-no-op
-    regressions are detectable at a glance. ``lr`` is the LR active
-    during the just-finished epoch (read before stepping the
-    scheduler).
+    ``member <idx>/<n> epoch <e>/<E>: train_loss=<float>
+    [val_loss=<float>] lr=<float>`` so SLURM logs surface training
+    progress and silent-no-op regressions are detectable at a glance.
     """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
-    lr = float(method_config.get("lr", 1.0e-3))
-    weight_decay = float(method_config.get("weight_decay", 0.0))
-    momentum = float(method_config.get("momentum", 0.9))
-    nesterov = bool(method_config.get("nesterov", False))
-    optimizer_name = str(method_config.get("optimizer", "sgd")).lower()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
-    # Optimizer dispatch: SGD by default (cross-method recipe-uniformity
-    # decision in decisions.md "Methods to evaluate"). For datasets like
-    # APPA-REAL where the wrapper trains a tiny MLP head over cached
-    # backbone features, SGD lr=1e-3 cosine decays to ~0 lr before the
-    # head converges. The dataset config can opt into AdamW via
-    # ``training.method_overrides.optimizer: adamw``; AdamW's adaptive
-    # per-parameter lr is the right tool for the linear-probe regime.
-    optimizer: torch.optim.Optimizer
-    if optimizer_name == "sgd":
-        optimizer = torch.optim.SGD(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-        )
-    elif optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=lr,
-            weight_decay=weight_decay,
-        )
-    else:
-        msg = (
-            f"unknown optimizer {optimizer_name!r} for ensemble; "
-            f"expected 'sgd' (default) or 'adamw'."
-        )
-        raise ValueError(msg)
+    optimizer = build_optimizer(
+        model,
+        optimizer_name=str(method_config.get("optimizer", "sgd")).lower(),
+        lr=float(method_config.get("lr", 1.0e-3)),
+        momentum=float(method_config.get("momentum", 0.9)),
+        weight_decay=float(method_config.get("weight_decay", 0.0)),
+        nesterov=bool(method_config.get("nesterov", False)),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(epochs, 1)
     )
-    model.train()
-    for epoch in range(epochs):
-        lr_now = float(scheduler.get_last_lr()[0])
-        epoch_loss = 0.0
-        n_batches = 0
-        for x, y in data_provider:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            logits = model(x)
-            log_probs = torch.log_softmax(logits, dim=1)
-            loss = -(y * log_probs).sum(dim=1).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += float(loss.detach().item())
-            n_batches += 1
-        train_loss = epoch_loss / max(n_batches, 1)
-        print(
-            f"member {member_idx + 1}/{n_members} epoch {epoch + 1}/{epochs}: "
-            f"train_loss={train_loss:.4f} lr={lr_now:.4f}",
-            flush=True,
-        )
-        scheduler.step()
-    return model
+    return train_with_val_tracking(
+        model,
+        data_provider,
+        val_provider,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epochs=epochs,
+        compute_loss=_soft_label_ce,
+        progress_prefix=f"member {member_idx + 1}/{n_members} ",
+    )
 
 
 def fit(
@@ -262,6 +244,8 @@ def fit(
     data_provider: FeatureProvider,
     model_factory: Callable[[], nn.Module],
     seed: int,
+    *,
+    val_data_provider: FeatureProvider | None = None,
 ) -> EnsembleHandle:
     """Train (or load) ``n_members`` ensemble members.
 
@@ -340,6 +324,7 @@ def fit(
                 member_provider,
                 method_config,
                 member_seed,
+                val_provider=val_data_provider,
                 member_idx=member_idx,
                 n_members=n_members,
             )

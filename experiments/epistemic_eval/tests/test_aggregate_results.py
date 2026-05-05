@@ -44,6 +44,13 @@ def _write_metrics_json(
         "loss": loss,
         "seed": seed,
         "aurec": aurec,
+        # ``excess_aurec`` and ``n_aurec`` are written by every
+        # post-eac4a24b ``compute_metrics`` invocation; the aggregator
+        # reads them, so the fixture must populate them too. Use
+        # plausible values derived from ``aurec`` to keep the synthetic
+        # numbers internally consistent.
+        "excess_aurec": aurec * 0.5,
+        "n_aurec": aurec * 5.0,
         "aurc": aurc,
         "pareto_gap": pareto_gap,
         "n_test_points": 100,

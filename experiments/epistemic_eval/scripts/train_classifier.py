@@ -363,6 +363,8 @@ def _train_cifar10h_run(
     criterion = nn.CrossEntropyLoss()
 
     log_rows: list[tuple[int, float, float, float, float]] = []
+    best_val_loss = float("inf")
+    best_state: dict[str, torch.Tensor] | None = None
     for epoch in range(hp["epochs"]):
         model.train()
         ep_loss = 0.0
@@ -400,6 +402,12 @@ def _train_cifar10h_run(
         val_loss = v_loss / max(v_total, 1)
         val_acc = v_correct / max(v_total, 1)
 
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+
         scheduler.step()
         log_rows.append((epoch, train_loss, val_loss, train_acc, val_acc))
         print(
@@ -409,8 +417,14 @@ def _train_cifar10h_run(
             flush=True,
         )
 
-    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    torch.save(state_dict, classifier_path)
+    # Save the best-val-loss state so a divergence-after-best-epoch
+    # trajectory (the failure mode that bit ensemble/evidential/ddu on
+    # CIFAR-10H pre-fix) cannot silently produce a uniform-output
+    # checkpoint. Falls through to the final-epoch state only if
+    # validation never produced a finite loss.
+    if best_state is None:
+        best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    torch.save(best_state, classifier_path)
     log_path = run_dir / "training_log.csv"
     log_path.write_text(
         "epoch,train_loss,val_loss,train_acc,val_acc\n"

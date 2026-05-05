@@ -107,6 +107,7 @@ def test_fit_threads_config_to_train_member(
         method_config: dict[str, Any],
         seed: int,
         *,
+        val_provider: FeatureProvider | None = None,  # noqa: ARG001
         member_idx: int = 0,
         n_members: int = 1,
     ) -> torch.nn.Module:

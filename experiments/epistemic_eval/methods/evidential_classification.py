@@ -43,7 +43,12 @@ from torch import nn
 from probly.method.evidential.classification import evidential_classification
 from probly.predictor import LogitClassifier
 
-from ._base import FeatureProvider, setup_determinism
+from ._base import (
+    FeatureProvider,
+    build_optimizer,
+    setup_determinism,
+    train_with_val_tracking,
+)
 
 
 @dataclass
@@ -116,11 +121,20 @@ def _evidential_ce_soft(alphas: torch.Tensor, y_soft: torch.Tensor) -> torch.Ten
     return per_sample.mean()
 
 
+def _evidential_compute_loss(
+    model: nn.Module, x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    """Forward-pass closure for :func:`_base.train_with_val_tracking`."""
+    return _evidential_ce_soft(model(x), y)
+
+
 def _train_evidential_model(
     model: nn.Module,
     data_provider: FeatureProvider,
     method_config: dict[str, Any],
     seed: int,
+    *,
+    val_provider: FeatureProvider | None = None,
 ) -> nn.Module:
     """Train an evidential-classification model with soft-label evidential CE.
 
@@ -128,6 +142,10 @@ def _train_evidential_model(
     ``nesterov`` from ``method_config``.
 
     Runs on GPU when one is available; falls back to CPU otherwise.
+    Uses :func:`_base.train_with_val_tracking`, so when ``val_provider``
+    is given the model state from the lowest-val-loss epoch is restored
+    before returning. Without ``val_provider`` the loop returns the
+    final-epoch state (back-compat for paths without a held-out split).
 
     Optimisation recipe (locked across all four UQ methods, mirrors
     :mod:`scripts.train_classifier`'s basecls path): SGD with momentum
@@ -136,77 +154,31 @@ def _train_evidential_model(
     is well-posed under SGD; this codebase locks SGD-cosine to keep
     the cross-method comparison recipe-uniform. See
     ``decisions.md`` -> "Methods to evaluate" for the rationale.
-
-    Per-epoch progress is printed to stdout in the format
-    ``epoch <e>/<E>: train_loss=<float> lr=<float>`` so SLURM logs
-    surface training progress. The accuracy columns from
-    :mod:`scripts.train_classifier` are omitted because this loop's
-    loss is on Dirichlet concentration parameters rather than class
-    probabilities, so a top-1 accuracy is not directly defined.
     """
     setup_determinism(seed)
     epochs = int(method_config.get("epochs", 1))
-    lr = float(method_config.get("lr", 1.0e-3))
-    weight_decay = float(method_config.get("weight_decay", 0.0))
-    momentum = float(method_config.get("momentum", 0.9))
-    nesterov = bool(method_config.get("nesterov", False))
-    optimizer_name = str(method_config.get("optimizer", "sgd")).lower()
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
-    # Optimizer dispatch: SGD by default (cross-method recipe-uniformity
-    # decision); ``training.method_overrides.optimizer: adamw`` opts into
-    # AdamW for the linear-probe regime where SGD-cosine underfits a
-    # small head over cached features. See ensemble._train_member for
-    # the same dispatch.
-    optimizer: torch.optim.Optimizer
-    if optimizer_name == "sgd":
-        optimizer = torch.optim.SGD(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            nesterov=nesterov,
-        )
-    elif optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=lr,
-            weight_decay=weight_decay,
-        )
-    else:
-        msg = (
-            f"unknown optimizer {optimizer_name!r} for evidential; "
-            f"expected 'sgd' (default) or 'adamw'."
-        )
-        raise ValueError(msg)
+    optimizer = build_optimizer(
+        model,
+        optimizer_name=str(method_config.get("optimizer", "sgd")).lower(),
+        lr=float(method_config.get("lr", 1.0e-3)),
+        momentum=float(method_config.get("momentum", 0.9)),
+        weight_decay=float(method_config.get("weight_decay", 0.0)),
+        nesterov=bool(method_config.get("nesterov", False)),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(epochs, 1)
     )
-    model.train()
-    for epoch in range(epochs):
-        lr_now = float(scheduler.get_last_lr()[0])
-        epoch_loss = 0.0
-        n_batches = 0
-        for x, y in data_provider:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            alphas = model(x)
-            loss = _evidential_ce_soft(alphas, y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += float(loss.detach().item())
-            n_batches += 1
-        train_loss = epoch_loss / max(n_batches, 1)
-        print(
-            f"epoch {epoch + 1}/{epochs}: "
-            f"train_loss={train_loss:.4f} lr={lr_now:.4f}",
-            flush=True,
-        )
-        scheduler.step()
-    return model
+    return train_with_val_tracking(
+        model,
+        data_provider,
+        val_provider,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epochs=epochs,
+        compute_loss=_evidential_compute_loss,
+    )
 
 
 def fit(
@@ -215,6 +187,8 @@ def fit(
     data_provider: FeatureProvider,
     model_factory: Callable[[], nn.Module],
     seed: int,
+    *,
+    val_data_provider: FeatureProvider | None = None,
 ) -> EvidentialClassificationHandle:
     """Train an evidential-classification model and return its handle.
 
@@ -245,7 +219,13 @@ def fit(
     base_model = model_factory()
     LogitClassifier.register_instance(base_model)
     model: nn.Module = evidential_classification(base_model)  # ty:ignore[invalid-argument-type]
-    trained = _train_evidential_model(model, data_provider, method_config, seed)
+    trained = _train_evidential_model(
+        model,
+        data_provider,
+        method_config,
+        seed,
+        val_provider=val_data_provider,
+    )
     head_factory_args = method_config.get("head_factory_args")
     return EvidentialClassificationHandle(
         state_dict={k: v.detach().cpu() for k, v in trained.state_dict().items()},
