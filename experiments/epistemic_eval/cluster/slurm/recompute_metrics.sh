@@ -36,15 +36,22 @@ if [[ ${#ALL_RUNS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-echo "found ${#ALL_RUNS[@]} method run directories."
+total_runs=${#ALL_RUNS[@]}
+echo "found $total_runs method run directories."
+echo "(progress prints one line per run; '.' per loss, 'F' on failure, 'S' on skip)"
+echo
 
 n_done=0
 n_skipped=0
 n_failed=0
+i=0
+declare -a FAILED_LOG=()
 
 for run_dir in "${ALL_RUNS[@]}"; do
+    i=$((i + 1))
+    printf "[%3d/%d] %s " "$i" "$total_runs" "$(basename "$run_dir")"
     if [[ ! -f "$run_dir/config.yaml" ]]; then
-        echo "skip $run_dir (no config.yaml)" >&2
+        printf "S (no config.yaml)\n"
         n_skipped=$((n_skipped + 1))
         continue
     fi
@@ -65,7 +72,7 @@ print(f"{ds} {sd}")
 PYEOF
     )
     if [[ -z "$dataset_name" || -z "$run_seed" ]]; then
-        echo "skip $run_dir (config missing dataset.name or seed)" >&2
+        printf "S (config missing dataset.name or seed)\n"
         n_skipped=$((n_skipped + 1))
         continue
     fi
@@ -79,7 +86,7 @@ PYEOF
     elif [[ ${#ORACLE_FALLBACK[@]} -gt 0 ]]; then
         oracle_run="${ORACLE_FALLBACK[-1]}"
     else
-        echo "skip $run_dir (no oracle run for dataset=$dataset_name)" >&2
+        printf "S (no oracle run for dataset=%s)\n" "$dataset_name"
         n_skipped=$((n_skipped + 1))
         continue
     fi
@@ -92,6 +99,7 @@ PYEOF
     shopt -u nullglob
     if [[ ${#DECOMPS[@]} -eq 0 ]]; then
         # Upstream pipeline didn't reach decomposition; not a failure.
+        printf "S (no decompositions yet)\n"
         n_skipped=$((n_skipped + 1))
         continue
     fi
@@ -104,13 +112,16 @@ PYEOF
             --run "$run_dir" \
             --loss "$loss" \
             --oracle-run "$oracle_run" \
-            --force-recompute >/dev/null; then
+            --force-recompute >/dev/null 2>&1; then
+            printf "."
             n_done=$((n_done + 1))
         else
-            echo "FAILED: $run_dir loss=$loss" >&2
+            printf "F(%s)" "$loss"
+            FAILED_LOG+=("$(basename "$run_dir") loss=$loss")
             n_failed=$((n_failed + 1))
         fi
     done
+    printf "\n"
 done
 
 echo
@@ -122,5 +133,10 @@ echo "   failures:            $n_failed"
 echo "============================================================"
 
 if [[ $n_failed -gt 0 ]]; then
+    echo
+    echo "Failed (loss):"
+    for f in "${FAILED_LOG[@]}"; do
+        echo "  - $f"
+    done
     exit 1
 fi
