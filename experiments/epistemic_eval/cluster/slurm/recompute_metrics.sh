@@ -9,14 +9,27 @@
 #
 # Per-run cost is fast (~1s, no GPU): the heavy work
 # (predictions / decompositions / oracle / p_star sidecars) is cached.
+# Calls are independent, so we parallelise via ``xargs -P``.
 #
 # Usage:
 #   bash experiments/epistemic_eval/cluster/slurm/recompute_metrics.sh
 #
+# Tunables (env vars):
+#   N_PARALLEL  worker processes (default: $(nproc), capped at 16)
+#   PY          python interpreter (default: .venv/bin/python)
+#
 # Skips:
 #   - basecls and oracle runs (no metrics_*.json by design)
-#   - runs missing decomposition_<loss>.npz (the upstream stage hasn't
-#     completed for that run yet -- skip without failing)
+#   - runs missing config.yaml or decomposition_<loss>.npz (the
+#     upstream pipeline hasn't reached that stage yet -- skip
+#     without failing)
+#
+# Oracle resolution:
+#   For DCIC the test set varies per seed (annotator-availability
+#   filtering produces different per-seed subsets), so we pick the
+#   same-seed oracle when one exists; first-order datasets like
+#   CIFAR-10H share a single seed=0 oracle and we fall back to it
+#   when a per-seed oracle is absent.
 
 set -euo pipefail
 cd "$(dirname "$0")/../../../.."
@@ -24,9 +37,23 @@ cd "$(dirname "$0")/../../../.."
 PY="${PY:-.venv/bin/python}"
 RUNS_ROOT="experiments/epistemic_eval/runs"
 
-# Match runs/2026<YYYYMMDD>_<exp>_<method>_<dataset>_seed<N>/ for every
-# UQ method we evaluate. Skip basecls (classifier-only) and oracle
-# (no metrics).
+if [[ -z "${N_PARALLEL:-}" ]]; then
+    if command -v nproc >/dev/null 2>&1; then
+        N_PARALLEL=$(nproc)
+    else
+        N_PARALLEL=8
+    fi
+    [[ $N_PARALLEL -gt 16 ]] && N_PARALLEL=16
+fi
+
+# ---------------------------------------------------------------------
+# Phase 1: enumerate work units (run_dir | loss | oracle_run).
+#
+# Doing this serially up-front lets us:
+#   - count the total so progress can show k/N
+#   - skip cleanly when oracle / config / decomposition is missing
+#   - keep the parallel worker dead-simple (just call compute_metrics)
+# ---------------------------------------------------------------------
 shopt -s nullglob
 ALL_RUNS=("$RUNS_ROOT"/2026*_main_{mc_dropout,evidential,ddu,ensemble}_*_seed*)
 shopt -u nullglob
@@ -36,32 +63,21 @@ if [[ ${#ALL_RUNS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-total_runs=${#ALL_RUNS[@]}
-echo "found $total_runs method run directories."
-echo "(progress prints one line per run; '.' per loss, 'F' on failure, 'S' on skip)"
-echo
+echo "found ${#ALL_RUNS[@]} method run directories. enumerating work..."
 
-n_done=0
+JOBS_FILE=$(mktemp)
+SKIP_LOG=$(mktemp)
+trap 'rm -f "$JOBS_FILE" "$SKIP_LOG"' EXIT
+
 n_skipped=0
-n_failed=0
-i=0
-declare -a FAILED_LOG=()
 
 for run_dir in "${ALL_RUNS[@]}"; do
-    i=$((i + 1))
-    printf "[%3d/%d] %s " "$i" "$total_runs" "$(basename "$run_dir")"
     if [[ ! -f "$run_dir/config.yaml" ]]; then
-        printf "S (no config.yaml)\n"
+        echo "$(basename "$run_dir"): no config.yaml" >> "$SKIP_LOG"
         n_skipped=$((n_skipped + 1))
         continue
     fi
 
-    # Pull dataset name and seed from the resolved config to find the
-    # matching oracle run. DCIC's test set varies per seed (different
-    # seeds yield different subsets after annotator filtering), so
-    # we pick the same-seed oracle when one exists; first-order
-    # datasets like CIFAR-10H share a single seed=0 oracle and we
-    # fall back to it when a per-seed oracle is absent.
     read -r dataset_name run_seed < <(
         $PY - "$run_dir/config.yaml" <<'PYEOF'
 import sys, yaml
@@ -72,7 +88,7 @@ print(f"{ds} {sd}")
 PYEOF
     )
     if [[ -z "$dataset_name" || -z "$run_seed" ]]; then
-        printf "S (config missing dataset.name or seed)\n"
+        echo "$(basename "$run_dir"): config missing dataset.name or seed" >> "$SKIP_LOG"
         n_skipped=$((n_skipped + 1))
         continue
     fi
@@ -80,49 +96,64 @@ PYEOF
     shopt -s nullglob
     ORACLE_MATCHING=("$RUNS_ROOT"/*_main_oracle_${dataset_name}_seed${run_seed})
     ORACLE_FALLBACK=("$RUNS_ROOT"/*_main_oracle_${dataset_name}_seed0)
+    DECOMPS=("$run_dir"/decomposition_*.npz)
     shopt -u nullglob
+
     if [[ ${#ORACLE_MATCHING[@]} -gt 0 ]]; then
         oracle_run="${ORACLE_MATCHING[-1]}"
     elif [[ ${#ORACLE_FALLBACK[@]} -gt 0 ]]; then
         oracle_run="${ORACLE_FALLBACK[-1]}"
     else
-        printf "S (no oracle run for dataset=%s)\n" "$dataset_name"
+        echo "$(basename "$run_dir"): no oracle for dataset=$dataset_name" >> "$SKIP_LOG"
         n_skipped=$((n_skipped + 1))
         continue
     fi
 
-    # Recompute every loss for which a decomposition exists. Each
-    # dataset declares its own supported losses, so the decomposition
-    # files present in the run dir are the source of truth.
-    shopt -s nullglob
-    DECOMPS=("$run_dir"/decomposition_*.npz)
-    shopt -u nullglob
     if [[ ${#DECOMPS[@]} -eq 0 ]]; then
-        # Upstream pipeline didn't reach decomposition; not a failure.
-        printf "S (no decompositions yet)\n"
+        echo "$(basename "$run_dir"): no decompositions yet" >> "$SKIP_LOG"
         n_skipped=$((n_skipped + 1))
         continue
     fi
 
     for decomp in "${DECOMPS[@]}"; do
-        # Strip prefix and suffix to get the loss name.
         loss=$(basename "$decomp" .npz)
-        loss=${loss#decomposition_}
-        if $PY -m experiments.epistemic_eval.scripts.compute_metrics \
-            --run "$run_dir" \
-            --loss "$loss" \
-            --oracle-run "$oracle_run" \
-            --force-recompute >/dev/null 2>&1; then
-            printf "."
-            n_done=$((n_done + 1))
-        else
-            printf "F(%s)" "$loss"
-            FAILED_LOG+=("$(basename "$run_dir") loss=$loss")
-            n_failed=$((n_failed + 1))
-        fi
+        loss="${loss#decomposition_}"
+        # Tab-separated; xargs splits on tabs cleanly.
+        printf '%s\t%s\t%s\n' "$run_dir" "$loss" "$oracle_run" >> "$JOBS_FILE"
     done
-    printf "\n"
 done
+
+total=$(wc -l < "$JOBS_FILE" | tr -d ' ')
+echo "queued $total recompute jobs (skipped $n_skipped runs); running $N_PARALLEL in parallel."
+echo
+
+# ---------------------------------------------------------------------
+# Phase 2: dispatch. Each xargs worker runs compute_metrics on one
+# (run, loss, oracle) triple. Workers print a single line on
+# completion; the awk pipe attaches a sequential [k/total] counter.
+# ---------------------------------------------------------------------
+RESULTS_FILE=$(mktemp)
+trap 'rm -f "$JOBS_FILE" "$SKIP_LOG" "$RESULTS_FILE"' EXIT
+
+export PY
+
+# shellcheck disable=SC2016
+< "$JOBS_FILE" xargs -P "$N_PARALLEL" -I {} -d '\n' bash -c '
+    IFS=$'\t' read -r run_dir loss oracle_run <<< "$0"
+    name=$(basename "$run_dir")
+    if "$PY" -m experiments.epistemic_eval.scripts.compute_metrics \
+        --run "$run_dir" --loss "$loss" \
+        --oracle-run "$oracle_run" --force-recompute >/dev/null 2>&1; then
+        printf "OK   %s loss=%s\n" "$name" "$loss"
+    else
+        printf "FAIL %s loss=%s\n" "$name" "$loss"
+    fi
+' {} \
+    | tee "$RESULTS_FILE" \
+    | awk -v t="$total" 'BEGIN{n=0} {n++; printf "[%4d/%d] %s\n", n, t, $0; fflush()}'
+
+n_done=$(grep -c '^OK ' "$RESULTS_FILE" || true)
+n_failed=$(grep -c '^FAIL ' "$RESULTS_FILE" || true)
 
 echo
 echo "============================================================"
@@ -132,11 +163,15 @@ echo "   runs skipped:        $n_skipped"
 echo "   failures:            $n_failed"
 echo "============================================================"
 
+if [[ $n_skipped -gt 0 ]]; then
+    echo
+    echo "Skipped run details:"
+    sed 's/^/  - /' "$SKIP_LOG"
+fi
+
 if [[ $n_failed -gt 0 ]]; then
     echo
-    echo "Failed (loss):"
-    for f in "${FAILED_LOG[@]}"; do
-        echo "  - $f"
-    done
+    echo "Failed jobs:"
+    grep '^FAIL ' "$RESULTS_FILE" | sed 's/^FAIL /  - /'
     exit 1
 fi
