@@ -1,0 +1,59 @@
+# Laplace approximation method config (linear-probe APPA-REAL only).
+#
+# Trains a fresh CE-loss MLP head as the MAP point, fits a full-Hessian
+# Laplace posterior over all head parameters via laplace-torch, and
+# samples S=20 weight draws at extract time. The cached representation
+# is log-probabilities (S, B, K) reshaped to (N, K, S) so the existing
+# ``logits_nks`` decomposition modules consume them unchanged
+# (softmax is shift-invariant; softmax(log p) == p).
+#
+# Backend: ASDL (forced by the wrapper) because curvlinops>=3 conflicts
+# with our pinned numpy 2.x. ASDL works fine for small linear-probe
+# heads and is the second-most-mature backend in laplace-torch.
+#
+# Not yet wired for full_network mode; see laplace.py:fit's
+# NotImplementedError.
+
+name: laplace
+method_module: experiments.epistemic_eval.methods.laplace
+
+# Last-layer Laplace (LLLA) is the canonical post-hoc Laplace variant
+# from Daxberger 2021. Only the final Linear layer's weights get a
+# Gaussian posterior; the rest of the head stays at MAP. Cheaper than
+# full-head Laplace (13k x 13k Hessian for our 128->101 last layer vs
+# 275k x 275k for the full head) and empirically as accurate per the
+# Daxberger paper.
+subset_of_weights: last_layer
+hessian_structure: full
+
+# Cache schema: log-probabilities packed as (N, K, S). Reuses the
+# logits_nks decomposition path -- softmax(log p) == p so downstream
+# code is agnostic.
+output_schema: logits_nks
+
+# Number of posterior weight draws used at extract time. 20 mirrors
+# MCD's n_samples on APPA-REAL so the inter-method comparison is on
+# equal sampling budgets.
+n_samples: 20
+
+# MAP head trained without dropout: Laplace samples weights, not
+# activations -- having a dropout layer in the head architecture
+# would conflate two stochasticity sources at extract time.
+head_dropout_p: 0.0
+
+# MAP head training (AdamW + soft-label CE; mirrors mc_dropout's
+# APPA-REAL recipe so the MAP point is comparable). 50 epochs is the
+# locked recipe for APPA-REAL linear-probe (see decisions.md).
+epochs: 50
+lr: 1.0e-3
+weight_decay: 5.0e-4
+
+# Type-II marginal-likelihood for prior precision tuning, the
+# standard Daxberger 2021 recipe. Closed-form for a Gaussian
+# posterior; stable for small heads.
+optimize_prior_precision_method: marglik
+
+# Predictive type for `Laplace.predictive_samples`. "glm" is the
+# generalised-linear-model linearisation around the MAP -- closed-
+# form sampling, fastest, and the convention the paper uses.
+pred_type: glm
