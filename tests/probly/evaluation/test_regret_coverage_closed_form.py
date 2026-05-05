@@ -14,6 +14,8 @@ import pytest
 from probly.evaluation.regret_coverage import (
     aurc,
     aurec,
+    excess_aurec,
+    n_aurec,
     regret_coverage_curve,
     risk_coverage_curve,
 )
@@ -163,3 +165,103 @@ def test_risk_coverage_validation_parallels_regret_coverage() -> None:
         risk_coverage_curve([], [])
     with pytest.raises(ValueError, match="same length"):
         aurc([1, 2, 3], [1, 2])
+
+
+# ---------------------------------------------------------------------------
+# Normalised AuReC (n_aurec) closed-form tests
+# ---------------------------------------------------------------------------
+
+
+def test_n_aurec_main_5_point_fixture() -> None:
+    # Reuses the same fixture as ``test_aurec_main_5_point_fixture``.
+    # Hand computation:
+    #   measured = aurec(score=[3,1,4,1,5], regret=[2,5,1,3,4]) = 1.66
+    #   oracle:   sort regret ascending -> [1,2,3,4,5];
+    #             cum/N=[0, 0.2, 0.6, 1.2, 2.0, 3.0]; trapezoid = 1.10
+    #   random:   0.5 * mean(regret) = 0.5 * 3.0 = 1.50
+    #   n_aurec = (1.66 - 1.10) / (1.50 - 1.10) = 0.56 / 0.40 = 1.40
+    # The score is anti-correlated with regret on this fixture (the
+    # accepted-regret order is [5, 3, 2, 1, 4]), so n_aurec > 1.0 is
+    # the expected outcome.
+    score = [3, 1, 4, 1, 5]
+    regret = [2, 5, 1, 3, 4]
+    np.testing.assert_allclose(n_aurec(score, regret), 1.40, rtol=1e-12, atol=1e-12)
+
+
+def test_n_aurec_oracle_ranking_is_zero() -> None:
+    # Sorting by ground-truth regret ascending is the oracle ranking;
+    # by construction n_aurec = 0.0 (modulo float rounding).
+    regret = [2.0, 5.0, 1.0, 3.0, 4.0]
+    assert n_aurec(regret, regret) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_n_aurec_constant_regret_returns_zero() -> None:
+    # All-equal regret: oracle == random == measured, denominator
+    # collapses to zero. Documented edge case returns 0.0 (the
+    # irreducible minimum is achieved trivially).
+    score = [5.0, 1.0, 4.0, 2.0, 3.0]
+    regret = [3.0, 3.0, 3.0, 3.0, 3.0]
+    assert n_aurec(score, regret) == 0.0
+
+
+def test_n_aurec_validation_matches_aurec() -> None:
+    # n_aurec runs the same input checks as aurec; spot-check a few.
+    with pytest.raises(ValueError, match="finite"):
+        n_aurec([1.0, 2.0, 3.0], [1.0, float("nan"), 3.0])
+    with pytest.raises(ValueError, match="same length"):
+        n_aurec([1.0, 2.0, 3.0], [1.0, 2.0])
+    with pytest.raises(TypeError, match="real numeric"):
+        n_aurec(np.array([1.0 + 2.0j, 3.0, 4.0]), [1.0, 2.0, 3.0])
+
+
+# ---------------------------------------------------------------------------
+# Excess AuReC (excess_aurec) closed-form tests
+# ---------------------------------------------------------------------------
+
+
+def test_excess_aurec_main_5_point_fixture() -> None:
+    # Reuses the same fixture as ``test_aurec_main_5_point_fixture``.
+    # Hand computation:
+    #   measured = aurec(score=[3,1,4,1,5], regret=[2,5,1,3,4]) = 1.66
+    #   oracle   = aurec(regret=[2,5,1,3,4], regret=...)        = 1.10
+    #   excess   = 1.66 - 1.10 = 0.56
+    score = [3, 1, 4, 1, 5]
+    regret = [2, 5, 1, 3, 4]
+    np.testing.assert_allclose(excess_aurec(score, regret), 0.56, rtol=1e-12, atol=1e-12)
+
+
+def test_excess_aurec_oracle_ranking_is_zero() -> None:
+    # Oracle ranking: score == regret (ascending). excess_aurec must be
+    # exactly 0.0 (modulo float rounding).
+    regret = [2.0, 5.0, 1.0, 3.0, 4.0]
+    assert excess_aurec(regret, regret) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_excess_aurec_constant_regret_is_zero() -> None:
+    # All-equal regret: oracle == measured for every score. excess = 0.0.
+    score = [5.0, 1.0, 4.0, 2.0, 3.0]
+    regret = [3.0, 3.0, 3.0, 3.0, 3.0]
+    assert excess_aurec(score, regret) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_excess_aurec_relation_to_n_aurec() -> None:
+    # Algebraic identity:
+    #     excess_aurec / (random_baseline - oracle_aurec) == n_aurec
+    # where ``random_baseline = 0.5 * mean(regret)``. Verifying on the
+    # 5-point fixture pins both functions to a single source of truth.
+    score = [3, 1, 4, 1, 5]
+    regret = [2, 5, 1, 3, 4]
+    excess = excess_aurec(score, regret)
+    oracle = aurec(regret, regret)
+    random_baseline = 0.5 * float(np.mean(regret))
+    expected_n = excess / (random_baseline - oracle)
+    np.testing.assert_allclose(n_aurec(score, regret), expected_n, rtol=1e-12, atol=1e-12)
+
+
+def test_excess_aurec_validation_matches_aurec() -> None:
+    # excess_aurec routes through aurec twice; spot-check that input
+    # validation surfaces from the first call.
+    with pytest.raises(ValueError, match="finite"):
+        excess_aurec([1.0, 2.0, 3.0], [1.0, float("nan"), 3.0])
+    with pytest.raises(ValueError, match="same length"):
+        excess_aurec([1.0, 2.0, 3.0], [1.0, 2.0])

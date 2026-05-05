@@ -208,6 +208,48 @@ def _fit_density_head(
     features_cat = torch.cat(feature_chunks, dim=0)
     labels_cat = torch.cat(label_chunks, dim=0)
     density_head.fit(features_cat, labels_cat)  # ty:ignore[call-non-callable,unresolved-attribute]
+    _sanitise_density_head(density_head)
+
+
+def _sanitise_density_head(density_head: nn.Module) -> None:
+    """Zero out classes whose Cholesky factor contains NaN entries.
+
+    probly's :class:`probly.method.ddu.torch.GaussianMixtureHead` walks
+    a jitter ladder until ``torch.linalg.cholesky`` stops raising
+    ``LinAlgError``. On near-singular sample covariances Cholesky can
+    return *without raising* but with NaN entries in the lower-
+    triangular factor (numerical underflow during the back-substitute
+    pass on a marginally PSD matrix). When that happens the affected
+    class's log-density is NaN for every test point, and the marginal
+    ``logsumexp(per_class_log_density)`` is NaN-poisoned for every row
+    of the cache.
+
+    APPA-REAL surfaces this on the linear-probe head: with 101 age
+    classes and ~75 train samples per populated class against a
+    128-dim feature space, several class covariances are
+    rank-deficient, and one (age 45 on seed 0) fell into the
+    Cholesky-without-error-but-with-NaN failure mode.
+
+    The fix is downstream of probly: any class whose ``scale_tril``
+    contains a NaN gets its prior mass redirected (``log_pi = -inf``)
+    and its factor reset to identity. It then contributes nothing to
+    the mixture density, leaving the well-fit classes intact. This is
+    benign for OOD detection (ill-fit classes shouldn't be scoring
+    points anyway) and avoids a probly fork.
+
+    Args:
+        density_head: A fitted GaussianMixtureHead (probly buffer
+            layout: ``means``, ``scale_tril``, ``log_pi``).
+    """
+    scale_tril = cast("torch.Tensor", density_head.scale_tril)
+    log_pi = cast("torch.Tensor", density_head.log_pi)
+    bad = torch.isnan(scale_tril).any(dim=(1, 2))
+    if not bad.any():
+        return
+    feature_dim = scale_tril.shape[-1]
+    eye = torch.eye(feature_dim, device=scale_tril.device, dtype=scale_tril.dtype)
+    scale_tril[bad] = eye
+    log_pi[bad] = float("-inf")
 
 
 def fit(

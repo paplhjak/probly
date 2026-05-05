@@ -22,6 +22,8 @@ Schema (locked, see ``tasks.md`` Task 7)::
         "loss":           <one of cross_entropy, zero_one, squared, absolute>,
         "seed":           <int>,
         "aurec":          <float>,
+        "excess_aurec":   <float>,
+        "n_aurec":        <float>,
         "aurc":           <float>,
         "pareto_gap":     <float>,
         "n_test_points":  <int>,
@@ -66,6 +68,8 @@ from probly.evaluation.regret_coverage import (  # noqa: E402
     _AUREC_VERSION,
     aurec,
     aurc,
+    excess_aurec,
+    n_aurec,
 )
 from probly.quantification.decomposition import OutputSchema  # noqa: E402
 from probly.quantification.realized_regret import (  # noqa: E402
@@ -77,7 +81,7 @@ from probly.quantification.realized_regret import (  # noqa: E402
 #: of ``_AUREC_VERSION`` and ``_PARETO_GAP_VERSION``; this captures
 #: changes to the orchestration in this script (e.g. how AuRC's risk
 #: is computed, how the BMA is derived from logits, etc.).
-_METRICS_VERSION: int = 1
+_METRICS_VERSION: int = 3
 
 
 def _git_commit() -> str:
@@ -458,6 +462,8 @@ def main(argv: list[str] | None = None) -> int:
     # We compute the cheaper sum.
     risk = regret.astype(np.float64) + a_star.astype(np.float64)
     aurec_value = aurec(e_hat, regret)
+    excess_aurec_value = excess_aurec(e_hat, regret)
+    n_aurec_value = n_aurec(e_hat, regret)
     aurc_value = aurc(e_hat, risk)
     pareto_gap_value = pareto_gap(a_hat, e_hat, a_star, e_star)
 
@@ -468,6 +474,8 @@ def main(argv: list[str] | None = None) -> int:
         "loss": loss_str,
         "seed": int(seed),
         "aurec": float(aurec_value),
+        "excess_aurec": float(excess_aurec_value),
+        "n_aurec": float(n_aurec_value),
         "aurc": float(aurc_value),
         "pareto_gap": float(pareto_gap_value),
         "n_test_points": int(n),

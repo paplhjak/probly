@@ -151,6 +151,143 @@ def aurec(score: Any, regret: Any) -> float:
     return float(np.trapezoid(curve, rho))
 
 
+def excess_aurec(score: Any, regret: Any) -> float:
+    """Compute the excess area under the regret-coverage curve (E-AuReC).
+
+    Subtracts the oracle AuReC (the theoretical minimum, achieved by
+    sorting points ascending by their ground-truth ``regret``) from the
+    measured AuReC. Lower is better; ``0.0`` indicates a theoretically
+    perfect epistemic ranking.
+
+    Excess AuReC has the **same units as the underlying loss**, so it
+    is directly interpretable -- "the user is paying X units of
+    avoidable per-point regret because the score isn't oracle-perfect."
+    For cross-loss or cross-dataset comparisons use :func:`n_aurec`
+    instead, which divides this excess by the random-score baseline
+    and is unitless. The two metrics produce identical method
+    orderings on a fixed ``regret`` vector
+    (``excess_aurec / (0.5 * mean(regret) - oracle_aurec) == n_aurec``),
+    so reporting both is redundant for ranking purposes; the value of
+    ``excess_aurec`` is its loss-unit interpretability.
+
+    Mirrors the "Excess AURC" construction from
+    Geifman, Uziel & El-Yaniv (2018, "Bias-Reduced Uncertainty
+    Estimation for Deep Neural Classifiers") but applied to the
+    regret-coverage curve rather than the risk-coverage curve.
+
+    Floating-point note. The return is non-negative *in exact
+    arithmetic*. Floating-point underflow can produce values on the
+    order of ``-1e-16`` when the score is the oracle ranking and
+    ``regret`` has many ties; callers should not assert strict
+    non-negativity.
+
+    Args:
+        score: Uncertainty score, shape ``(N,)``. Lower means accept
+            first (same convention as :func:`aurec`).
+        regret: Per-point ground-truth regret ``E*(x)``, shape
+            ``(N,)``.
+
+    Returns:
+        The excess AuReC as a Python ``float``.
+
+    Raises:
+        TypeError: If either argument has a non-real dtype.
+        ValueError: If shapes are wrong, lengths mismatch, or the
+            arrays contain non-finite entries.
+
+    """
+    measured = aurec(score, regret)
+    # Sorting ``regret`` ascending against itself is the oracle order
+    # because the (N + 1)-grid prefix sum of the sorted-ascending
+    # regret minimises the trapezoidal area.
+    oracle = aurec(score=regret, regret=regret)
+    return float(measured - oracle)
+
+
+def n_aurec(score: Any, regret: Any) -> float:
+    """Compute the normalised area under the regret-coverage curve.
+
+    Min-max normalisation of :func:`aurec` between the oracle and
+    random-score baselines. The convention matches raw AuReC
+    (lower-is-better):
+
+    * ``0.0`` -- ranking is as good as the oracle (sorting by ground-
+      truth ``regret``); the smallest AuReC achievable on this regret
+      vector.
+    * ``1.0`` -- ranking is no better than a uniformly-random score
+      (in expectation).
+    * ``> 1.0`` -- ranking is *worse* than random (e.g. an
+      anti-correlated score systematically rejects the easy points).
+
+    Why this exists. Raw ``aurec`` confounds two factors: how well the
+    underlying predictor performs on the dataset (which sets the scale
+    of ``regret``) and how well the uncertainty score ``ranks`` those
+    regrets. A model with lower mean regret can win on raw AuReC even
+    if its uncertainty scoring is the *worse* of two systems. The
+    normalisation isolates ranking quality.
+
+    The denominator uses the *expected* random-score AuReC,
+    ``0.5 * mean(regret)`` (the area of the triangle from ``(0, 0)``
+    to ``(1, mean(regret))``). This is the standard analytical
+    baseline used in the Excess-AURC literature
+    (Geifman, Uziel & El-Yaniv, 2018) and avoids Monte-Carlo noise
+    from sampling random permutations.
+
+    Relation to the AUGRC literature. The kernel
+    :func:`_coverage_curve` divides cumulative regret by the *full* set
+    size ``N`` rather than the number of accepted points ``k``; the
+    resulting curve and area are the *generalised* (joint-expectation)
+    risk-coverage quantities advocated by Jaeger, Traub et al.
+    (2024) -- the formulation that sidesteps the monotonicity flaws of
+    classical AURC. ``n_aurec`` adds a normalisation on top so the
+    ranking-quality signal is comparable across datasets and
+    predictors of differing capacity.
+
+    Edge case. If every point has identical regret then
+    ``oracle == random == measured`` and the denominator is zero. The
+    ranking signal does not exist on such inputs (no ordering can do
+    better than any other), and we return ``0.0`` -- the irreducible
+    minimum is achieved trivially. Callers that need to distinguish
+    "perfect" from "degenerate" should inspect the regret variance
+    separately.
+
+    Args:
+        score: Uncertainty score, shape ``(N,)``. Lower means accept
+            first (same convention as :func:`aurec`).
+        regret: Per-point regret ``E*(x)``, shape ``(N,)``. Must be
+            non-negative.
+
+    Returns:
+        The normalised AuReC as a Python ``float``.
+
+    Raises:
+        TypeError: If either argument has a non-real dtype.
+        ValueError: If shapes are wrong, lengths mismatch, or the
+            arrays contain non-finite entries.
+
+    """
+    score_arr = _check_1d_finite_real(score, name="score")
+    regret_arr = _check_1d_finite_real(regret, name="regret")
+    _check_matching_lengths(score_arr, regret_arr, name_a="score", name_b="regret")
+
+    rho_meas, curve_meas = _coverage_curve(score_arr, regret_arr)
+    measured = float(np.trapezoid(curve_meas, rho_meas))
+
+    # Oracle: sorting by regret (same direction as score) minimises
+    # every prefix sum, hence minimises the trapezoidal area.
+    rho_oracle, curve_oracle = _coverage_curve(regret_arr, regret_arr)
+    oracle = float(np.trapezoid(curve_oracle, rho_oracle))
+
+    # Random baseline (expectation): area of the triangle from (0, 0)
+    # to (1, mean(regret)).
+    random_baseline = 0.5 * float(np.mean(regret_arr))
+
+    denominator = random_baseline - oracle
+    if denominator <= 0.0:
+        return 0.0
+    return float((measured - oracle) / denominator)
+
+
 def risk_coverage_curve(
     score: Any,
     risk: Any,
