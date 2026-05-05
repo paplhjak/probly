@@ -21,10 +21,11 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import importlib
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Iterator, Literal, cast
 
 import numpy as np
 import torch
@@ -161,6 +162,62 @@ def _build_head_factory(
     return factory, args
 
 
+class _OneHotCIFAR10(torch.utils.data.Dataset):  # type: ignore[type-arg]
+    """Wraps ``CIFAR10NoMD5`` so ``__getitem__`` returns one-hot labels.
+
+    The from-scratch UQ training paths (ensemble per-member, evidential,
+    ddu) compute soft-label cross-entropy
+    ``-(y * log_probs).sum(dim=1).mean()`` against ``(B, K)`` float
+    targets. CIFAR10NoMD5 yields ``(image, int)``; this thin wrapper
+    one-hots the int into a ``(K,)`` float tensor at fetch time so the
+    DataLoader's default collate stacks ``y`` into ``(B, K)`` directly.
+    """
+
+    def __init__(self, base: Any, num_classes: int) -> None:
+        self.base = base
+        self.num_classes = int(num_classes)
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        x, y = self.base[idx]
+        y_oh = torch.zeros(self.num_classes, dtype=torch.float32)
+        y_oh[int(y)] = 1.0
+        return x, y_oh
+
+
+@dataclass
+class _DataLoaderProvider:
+    """A ``FeatureProvider``-shaped wrapper around a torch ``DataLoader``.
+
+    Mirrors :class:`experiments.epistemic_eval.datasets.dcic._DataLoaderProvider`
+    so per-epoch shuffling and per-fetch transform application are live
+    (the previous ``FeatureProvider(batches=[...])`` construction
+    pre-materialised batches once, which froze ``RandomCrop`` /
+    ``RandomHorizontalFlip`` across all 200 epochs and caused the
+    CIFAR-10H ensemble/evidential/ddu networks to decay back to uniform
+    output by epoch ~150).
+    """
+
+    dataloader: torch.utils.data.DataLoader[Any]
+    n_classes: int
+    indices: np.ndarray
+    mode: Literal["full_network", "linear_probe"] = "full_network"
+    feature_dim: int | None = None
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        return iter(self.dataloader)
+
+    def __len__(self) -> int:
+        return len(self.dataloader)
+
+    @property
+    def n_samples(self) -> int:
+        return int(self.indices.shape[0])
+
+
 def _make_full_network_cifar10h_train_provider(
     dataset_config: dict[str, Any],
     batch_size: int = 128,
@@ -169,11 +226,12 @@ def _make_full_network_cifar10h_train_provider(
 
     Used by the ensemble path that trains each member from scratch
     (no ``ensemble_classifier_paths`` and no pretrained checkpoint
-    in the dataset config). Loads CIFAR-10 train via
-    :class:`CIFAR10NoMD5`, one-hot encodes the integer labels so they
-    plug into the soft-label cross-entropy loss in
-    :func:`ensemble._train_member`, and returns a
-    :class:`FeatureProvider` over the full 50k training set.
+    in the dataset config). Wraps :class:`CIFAR10NoMD5` with
+    train-time transforms (``RandomCrop`` + ``RandomHorizontalFlip`` +
+    ``Normalize``) and a ``DataLoader(shuffle=True)`` so augmentation
+    re-randomises every epoch and labels are one-hotted into ``(B, K)``
+    floats at fetch time for the soft-label cross-entropy used by
+    ``ensemble._train_member`` and the other from-scratch UQ paths.
     """
     from torchvision import transforms as T  # noqa: PLC0415
 
@@ -196,36 +254,28 @@ def _make_full_network_cifar10h_train_provider(
 
     cifar_root = dataset_config.get("loader_kwargs", {}).get("root", "data/cifar10h")
     train_ds = CIFAR10NoMD5(root=cifar_root, train=True, transform=transform)
-    n = len(train_ds)
     num_classes = int(dataset_config.get("classifier", {}).get("num_classes", 10))
+    one_hot_ds = _OneHotCIFAR10(train_ds, num_classes=num_classes)
+    n = len(one_hot_ds)
     indices = np.arange(n, dtype=np.int64)
 
-    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for start in range(0, n, batch_size):
-        stop = min(start + batch_size, n)
-        xs: list[torch.Tensor] = []
-        ys: list[int] = []
-        for i in range(start, stop):
-            x, y = train_ds[i]
-            xs.append(x)
-            ys.append(int(y))
-        x_batch = torch.stack(xs, dim=0)
-        # One-hot encode int labels into a (B, K) float tensor so the
-        # soft-label cross-entropy in ensemble._train_member /
-        # mc_dropout._train_mc_dropout_model
-        # (``loss = -(y * log_probs).sum(dim=1).mean()``) gets the
-        # right input dtype + shape.
-        y_batch = torch.zeros(len(ys), num_classes, dtype=torch.float32)
-        y_batch[torch.arange(len(ys)), torch.tensor(ys, dtype=torch.long)] = 1.0
-        batches.append((x_batch, y_batch))
+    pin_memory = bool(torch.cuda.is_available())
+    dataloader: torch.utils.data.DataLoader[Any] = torch.utils.data.DataLoader(
+        one_hot_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
 
-    return FeatureProvider(
-        batches=batches,
-        mode="full_network",
-        feature_dim=None,
+    provider = _DataLoaderProvider(
+        dataloader=dataloader,
         n_classes=num_classes,
         indices=indices,
+        mode="full_network",
+        feature_dim=None,
     )
+    return cast("FeatureProvider", provider)
 
 
 def _make_full_network_stub_provider(
