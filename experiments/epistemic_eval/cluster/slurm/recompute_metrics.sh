@@ -49,31 +49,40 @@ for run_dir in "${ALL_RUNS[@]}"; do
         continue
     fi
 
-    # Pull dataset name from the resolved config to find the matching
-    # oracle run. Datasets keep one oracle run (seed 0) shared across
-    # method seeds; pick it via glob.
-    dataset_name=$(
+    # Pull dataset name and seed from the resolved config to find the
+    # matching oracle run. DCIC's test set varies per seed (different
+    # seeds yield different subsets after annotator filtering), so
+    # we pick the same-seed oracle when one exists; first-order
+    # datasets like CIFAR-10H share a single seed=0 oracle and we
+    # fall back to it when a per-seed oracle is absent.
+    read -r dataset_name run_seed < <(
         $PY - "$run_dir/config.yaml" <<'PYEOF'
 import sys, yaml
 cfg = yaml.safe_load(open(sys.argv[1]))
-print((cfg.get("dataset") or {}).get("name", ""))
+ds = (cfg.get("dataset") or {}).get("name", "")
+sd = cfg.get("seed", "")
+print(f"{ds} {sd}")
 PYEOF
     )
-    if [[ -z "$dataset_name" ]]; then
-        echo "skip $run_dir (no dataset.name in config)" >&2
+    if [[ -z "$dataset_name" || -z "$run_seed" ]]; then
+        echo "skip $run_dir (config missing dataset.name or seed)" >&2
         n_skipped=$((n_skipped + 1))
         continue
     fi
 
     shopt -s nullglob
-    ORACLE_CANDIDATES=("$RUNS_ROOT"/*_main_oracle_${dataset_name}_seed0)
+    ORACLE_MATCHING=("$RUNS_ROOT"/*_main_oracle_${dataset_name}_seed${run_seed})
+    ORACLE_FALLBACK=("$RUNS_ROOT"/*_main_oracle_${dataset_name}_seed0)
     shopt -u nullglob
-    if [[ ${#ORACLE_CANDIDATES[@]} -eq 0 ]]; then
+    if [[ ${#ORACLE_MATCHING[@]} -gt 0 ]]; then
+        oracle_run="${ORACLE_MATCHING[-1]}"
+    elif [[ ${#ORACLE_FALLBACK[@]} -gt 0 ]]; then
+        oracle_run="${ORACLE_FALLBACK[-1]}"
+    else
         echo "skip $run_dir (no oracle run for dataset=$dataset_name)" >&2
         n_skipped=$((n_skipped + 1))
         continue
     fi
-    oracle_run="${ORACLE_CANDIDATES[-1]}"
 
     # Recompute every loss for which a decomposition exists. Each
     # dataset declares its own supported losses, so the decomposition
