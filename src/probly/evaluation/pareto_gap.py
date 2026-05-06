@@ -28,7 +28,7 @@ from probly.evaluation.selectors import (
     sweep_oracle_surface,
 )
 
-_PARETO_GAP_VERSION: int = 2
+_PARETO_GAP_VERSION: int = 3
 """Module-level version of the Pareto-gap (IGD+) implementation.
 Bumped on math changes; read by ``compute_metrics.py`` and written
 into ``metrics_<loss>.json`` as ``_pareto_gap_version`` for cache
@@ -53,7 +53,17 @@ History:
         which handles the ~510k-910k row surfaces produced at
         ``N=10000`` in seconds. v2 also drops the v1 subsampling +
         random-seed knobs (``max_surface_points``,
-        ``subsample_seed``); the metric is now deterministic."""
+        ``subsample_seed``); the metric is now deterministic.
+    v3: No code change in ``pareto_gap.py``; bumped because
+        ``compute_metrics.py`` now passes the *realised regret*
+        array as the function's ``e_star`` argument, matching the
+        paper's frequentist evaluation (where E* per-point equals
+        the realised regret of the trained predictor). Pre-v3 cached
+        values used ``e_star = 0`` (the codebase's oracle-of-itself
+        convention), which made the oracle surface ``S^{*}``
+        degenerate (all ``lambda`` values produced the same point
+        ordering: rank by Bayes risk). Cached pre-v3 metrics are
+        invalidated and recomputed on next ``recompute_metrics``."""
 
 
 def _check_2d_finite_real_three_columns(arr: Any, *, name: str) -> np.ndarray:
@@ -298,8 +308,19 @@ def pareto_gap(
     Args:
         a_hat: Estimated aleatoric component, shape ``(N,)``.
         e_hat: Estimated epistemic component, shape ``(N,)``.
-        a_star: Ground-truth aleatoric component, shape ``(N,)``.
+        a_star: Ground-truth aleatoric component, shape ``(N,)``;
+            typically the Bayes-optimal predictor's per-point loss
+            ``min_{y*} E_y[loss(y*, y)]``.
         e_star: Ground-truth epistemic component, shape ``(N,)``.
+            Under the paper's frequentist evaluation, ``E*`` per
+            point equals the realised regret of the trained
+            predictor; callers should pass that array (i.e. the
+            per-point output of
+            :func:`probly.quantification.realized_regret.compute_realized_regret`),
+            **not** the codebase's stored ``E_star`` from
+            ``oracle_<loss>.npz`` (which is identically zero by the
+            oracle-of-itself convention and makes the oracle
+            surface degenerate).
         n_lambda: Number of points on the oracle ``lambda``-grid in
             ``[1/2, 1]``; defaults to ``51``. Must be ``>= 2``.
         n_directions: Number of angles on the empirical

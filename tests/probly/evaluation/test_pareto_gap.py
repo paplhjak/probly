@@ -355,12 +355,17 @@ def test_pareto_gap_exact_matches_brute_force_on_large_fixture() -> None:
 
 
 def test_pareto_gap_version_bumped() -> None:
-    """``_PARETO_GAP_VERSION`` must equal 2 after the v1->v2 math change.
+    """``_PARETO_GAP_VERSION`` is the cache-invalidation contract for
+    ``compute_metrics.py``: any ``metrics_<loss>.json`` written under a
+    prior version should be regenerated when downstream code reads it.
 
-    Bumping the version string is the cache-invalidation contract for
-    ``compute_metrics.py``: any ``metrics_<loss>.json`` written under
-    v1 should be regenerated when downstream code reads it.
+    Pinned to the current value: bump the constant AND this test
+    together when the math changes. Recent bumps:
+        v2: lossless Pareto-front filtering inside ``pareto_gap``.
+        v3: ``compute_metrics.py`` started passing realised regret as
+            ``e_star`` (frequentist evaluation), making the oracle
+            surface non-degenerate.
     """
     from probly.evaluation.pareto_gap import _PARETO_GAP_VERSION
 
-    assert _PARETO_GAP_VERSION == 2
+    assert _PARETO_GAP_VERSION == 3

@@ -465,7 +465,21 @@ def main(argv: list[str] | None = None) -> int:
     excess_aurec_value = excess_aurec(e_hat, regret)
     n_aurec_value = n_aurec(e_hat, regret)
     aurc_value = aurc(e_hat, risk)
-    pareto_gap_value = pareto_gap(a_hat, e_hat, a_star, e_star)
+    # Pareto-gap: under the paper's frequentist evaluation
+    # (paper_tex/sections/empirical.tex, "Evaluation protocol and the
+    # Pareto-gap" paragraph), the oracle-side ``E*`` "collapses" to the
+    # pointwise realised regret of the trained predictor. The oracle
+    # file's ``E_star`` is identically zero by construction (the
+    # Bayes-optimal predictor has no epistemic uncertainty about
+    # itself; see ``oracle.py:202-207``), which would make the
+    # oracle-surface score ``(1-lambda) A* + lambda E*`` degenerate
+    # (just rank by ``a_star``). Pass the per-method per-point
+    # ``regret`` array instead so the surface ``S^{*}`` matches the
+    # paper's definition. The function's internal risk coordinate
+    # ``a + e`` then evaluates to ``A_Bayes + r = T*`` (total realised
+    # risk) and the regret coordinate ``e`` to ``r`` (realised regret),
+    # both matching the paper's S^{*} coordinate definition.
+    pareto_gap_value = pareto_gap(a_hat, e_hat, a_star, regret)
 
     payload: dict[str, Any] = {
         "run_id": run_dir.name,
