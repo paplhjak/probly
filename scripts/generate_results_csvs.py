@@ -56,7 +56,12 @@ from probly.evaluation.pareto_gap import pareto_gap as _pareto_gap_fn  # noqa: E
 from probly.quantification.realized_regret import compute_realized_regret  # noqa: E402
 
 LOCAL_RUNS = _REPO_ROOT / "experiments" / "epistemic_eval" / "runs"
-CLUSTER_RUNS = _REPO_ROOT / "cluster_probly" / "probly" / "experiments" / "epistemic_eval" / "runs"
+# When running on the laptop the cluster lives at the read-only sshfs
+# mount; when running on the cluster the same script reads its own
+# ``runs/`` directory directly. Detect by checking whether the mount
+# path exists; fall back to ``LOCAL_RUNS`` when it doesn't.
+_CLUSTER_MOUNT = _REPO_ROOT / "cluster_probly" / "probly" / "experiments" / "epistemic_eval" / "runs"
+CLUSTER_RUNS = _CLUSTER_MOUNT if _CLUSTER_MOUNT.exists() else LOCAL_RUNS
 OUT_DIR = _REPO_ROOT / "experiments" / "epistemic_eval" / "results" / "csv"
 
 DATASET_LOSSES: dict[str, list[str]] = {
@@ -220,15 +225,17 @@ def _row_for(
         out["rho_Ehat_regret"] = _spear(e_hat, regret)
         out["rho_Astar_regret"] = _spear(a_star, regret)
 
-        # Recompute Pareto-gap locally with the corrected frequentist
-        # convention: E* per-point equals the realised regret, not the
-        # codebase's stored E_star = 0. The cluster-side metrics JSON
-        # may carry the old (degenerate) value until ``recompute_metrics``
-        # reruns; override here so the CSV always reflects the
-        # paper-correct surface. Skip if the regret array is degenerate
-        # (e.g., dcic_synthetic mc_dropout zero_one cells where the
-        # classifier is essentially perfect).
-        if regret.std() > 0:
+        # Pareto-gap fallback: if the cluster's metrics_<loss>.json was
+        # written under the pre-fix Pareto-gap version (<3, where
+        # ``e_star = 0`` made the oracle surface degenerate), recompute
+        # locally with the corrected frequentist convention. With v3+
+        # the JSON value is already correct and we just keep what we
+        # loaded above. The Pareto-gap call is the expensive part of
+        # this script (51 lambdas x 91 directions x N points), so this
+        # short-circuit makes the regenerator fast when the cluster is
+        # up-to-date.
+        pg_version = int(m.get("_pareto_gap_version", 0))
+        if pg_version < 3 and regret.std() > 0:
             try:
                 out["pareto_gap"] = float(
                     _pareto_gap_fn(a_hat, e_hat, a_star, regret)
