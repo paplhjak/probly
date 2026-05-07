@@ -60,8 +60,21 @@ LOCAL_RUNS = _REPO_ROOT / "experiments" / "epistemic_eval" / "runs"
 # mount; when running on the cluster the same script reads its own
 # ``runs/`` directory directly. Detect by checking whether the mount
 # path exists; fall back to ``LOCAL_RUNS`` when it doesn't.
-_CLUSTER_MOUNT = _REPO_ROOT / "cluster_probly" / "probly" / "experiments" / "epistemic_eval" / "runs"
-CLUSTER_RUNS = _CLUSTER_MOUNT if _CLUSTER_MOUNT.exists() else LOCAL_RUNS
+_CLUSTER_MOUNT_CANDIDATES = (
+    _REPO_ROOT / "cluster_probly" / "probly" / "experiments" / "epistemic_eval" / "runs",
+    Path.home() / "cluster_probly" / "probly" / "experiments" / "epistemic_eval" / "runs",
+)
+CLUSTER_RUNS = LOCAL_RUNS
+for _candidate in _CLUSTER_MOUNT_CANDIDATES:
+    try:
+        if _candidate.exists():
+            CLUSTER_RUNS = _candidate
+            break
+    except OSError:
+        # SSHFS mounts can raise Input/output error from a stale
+        # connection; treat that as "not available" and try the next
+        # candidate rather than crashing.
+        continue
 OUT_DIR = _REPO_ROOT / "experiments" / "epistemic_eval" / "results" / "csv"
 
 DATASET_LOSSES: dict[str, list[str]] = {
@@ -167,7 +180,14 @@ def _row_for(
         out["status"] = S_MISSING_RUN
         out["notes"] = "no run dir matching glob"
         return out
-    out["run_dir"] = str(rd.relative_to(_REPO_ROOT))
+    try:
+        # Prefer a repo-relative path when the run lives under the repo
+        # root (the on-cluster case); fall back to the absolute path
+        # for cluster-mount runs, which sit outside the repo tree on
+        # the laptop.
+        out["run_dir"] = str(rd.relative_to(_REPO_ROOT))
+    except ValueError:
+        out["run_dir"] = str(rd)
 
     oracle_dir = _find_oracle_dir(runs_root, dataset, seed)
     if oracle_dir is None:
@@ -200,6 +220,29 @@ def _row_for(
         out["pareto_gap"] = float(m["pareto_gap"])
         out["n_test_points"] = int(m["n_test_points"])
 
+        # Fast path: with ``_metrics_version >= 4`` the cluster has
+        # already baked the Spearman correlations and the v3 Pareto-gap
+        # into the JSON, so we can skip the per-cell predictions /
+        # decomposition / oracle reads (each ~10-50 MB over SSHFS)
+        # entirely. Older runs fall through to the slow path below.
+        rho_keys = (
+            "rho_Ahat_Ehat", "rho_Ahat_Astar", "rho_Ahat_regret",
+            "rho_Ehat_Astar", "rho_Ehat_regret", "rho_Astar_regret",
+        )
+        metrics_version = int(m.get("_metrics_version", 0))
+        pg_version = int(m.get("_pareto_gap_version", 0))
+        rho_present = all(k in m for k in rho_keys)
+        if metrics_version >= 4 and rho_present and pg_version >= 3:
+            for k in rho_keys:
+                v = m[k]
+                out[k] = float("nan") if v is None else float(v)
+            out["status"] = S_OK
+            out["notes"] = ""
+            return out
+
+        # Slow path: re-load NPZs to compute correlations and (if
+        # needed) recompute the Pareto-gap under the v3 frequentist
+        # convention.
         cfg = yaml.safe_load((rd / "config.yaml").read_text())
         schema = (cfg.get("method") or {}).get("output_schema", "logits_nks")
         pred = np.load(rd / "predictions.npz")
@@ -225,16 +268,6 @@ def _row_for(
         out["rho_Ehat_regret"] = _spear(e_hat, regret)
         out["rho_Astar_regret"] = _spear(a_star, regret)
 
-        # Pareto-gap fallback: if the cluster's metrics_<loss>.json was
-        # written under the pre-fix Pareto-gap version (<3, where
-        # ``e_star = 0`` made the oracle surface degenerate), recompute
-        # locally with the corrected frequentist convention. With v3+
-        # the JSON value is already correct and we just keep what we
-        # loaded above. The Pareto-gap call is the expensive part of
-        # this script (51 lambdas x 91 directions x N points), so this
-        # short-circuit makes the regenerator fast when the cluster is
-        # up-to-date.
-        pg_version = int(m.get("_pareto_gap_version", 0))
         if pg_version < 3 and regret.std() > 0:
             try:
                 out["pareto_gap"] = float(

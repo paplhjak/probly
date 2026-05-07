@@ -76,12 +76,36 @@ from probly.quantification.realized_regret import (  # noqa: E402
     LossName,
     compute_realized_regret,
 )
+from scipy.stats import spearmanr  # noqa: E402
+
+
+def _spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rank correlation, NaN if either input has zero variance.
+
+    Used to bake the diagnostic correlations into ``metrics_<loss>.json``
+    so downstream aggregators can read them without re-touching the
+    per-run NPZ files (which dominate SSHFS-mounted regen cost).
+    """
+    if a.std() <= 0 or b.std() <= 0:
+        return float("nan")
+    rho = spearmanr(a, b).statistic
+    return float(rho) if rho is not None else float("nan")
 
 #: Bumped on math changes to invalidate cached metrics JSON. Independent
 #: of ``_AUREC_VERSION`` and ``_PARETO_GAP_VERSION``; this captures
 #: changes to the orchestration in this script (e.g. how AuRC's risk
 #: is computed, how the BMA is derived from logits, etc.).
-_METRICS_VERSION: int = 3
+#:
+#: Version history:
+#:   3 -> Pareto-gap consumes per-point realised regret (frequentist
+#:        evaluation), see paper_tex/sections/empirical.tex.
+#:   4 -> Six Spearman correlations baked into the JSON
+#:        (rho_{Ahat,Ehat}, rho_{Ahat,Astar}, rho_{Ahat,regret},
+#:        rho_{Ehat,Astar}, rho_{Ehat,regret}, rho_{Astar,regret}).
+#:        Lets ``generate_results_csvs.py`` skip the local
+#:        predictions.npz / decomposition.npz / p_star.npz reads,
+#:        which dominated the SSHFS-mounted regen cost.
+_METRICS_VERSION: int = 4
 
 
 def _git_commit() -> str:
@@ -481,6 +505,25 @@ def main(argv: list[str] | None = None) -> int:
     # both matching the paper's S^{*} coordinate definition.
     pareto_gap_value = pareto_gap(a_hat, e_hat, a_star, regret)
 
+    # Diagnostic Spearman correlations. Computed here (rather than in
+    # the downstream CSV aggregator) so the aggregator can read them
+    # straight from the JSON without re-loading predictions.npz /
+    # decomposition_<loss>.npz / oracle_<loss>.npz / p_star.npz over
+    # SSHFS. Same definition the aggregator used previously: NaN when
+    # either operand has zero variance. We mirror the rho_* naming
+    # used by ``generate_results_csvs.py`` so the two stay
+    # interchangeable.
+    a_hat_1d = np.asarray(a_hat, dtype=np.float64)
+    e_hat_1d = np.asarray(e_hat, dtype=np.float64)
+    a_star_1d = np.asarray(a_star, dtype=np.float64)
+    regret_1d = np.asarray(regret, dtype=np.float64)
+    rho_Ahat_Ehat = _spearman(a_hat_1d, e_hat_1d)
+    rho_Ahat_Astar = _spearman(a_hat_1d, a_star_1d)
+    rho_Ahat_regret = _spearman(a_hat_1d, regret_1d)
+    rho_Ehat_Astar = _spearman(e_hat_1d, a_star_1d)
+    rho_Ehat_regret = _spearman(e_hat_1d, regret_1d)
+    rho_Astar_regret = _spearman(a_star_1d, regret_1d)
+
     payload: dict[str, Any] = {
         "run_id": run_dir.name,
         "method": method,
@@ -492,6 +535,12 @@ def main(argv: list[str] | None = None) -> int:
         "n_aurec": float(n_aurec_value),
         "aurc": float(aurc_value),
         "pareto_gap": float(pareto_gap_value),
+        "rho_Ahat_Ehat": rho_Ahat_Ehat,
+        "rho_Ahat_Astar": rho_Ahat_Astar,
+        "rho_Ahat_regret": rho_Ahat_regret,
+        "rho_Ehat_Astar": rho_Ehat_Astar,
+        "rho_Ehat_regret": rho_Ehat_regret,
+        "rho_Astar_regret": rho_Astar_regret,
         "n_test_points": int(n),
         "config_hash": cfg_hash,
         "_metrics_version": int(_METRICS_VERSION),
